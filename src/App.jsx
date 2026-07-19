@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target } from "lucide-react";
+import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target, FileUp, Lock } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import { buildDiagnostics } from "./advisor";
 
@@ -148,6 +148,11 @@ export default function App() {
   const [showImport, setShowImport] = useState(false);
   const [importRaw, setImportRaw] = useState("");
   const [reviewItems, setReviewItems] = useState(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfPendingFile, setPdfPendingFile] = useState(null); // PDF protegido aguardando senha
+  const [pdfPassword, setPdfPassword] = useState("");
+  const [pdfError, setPdfError] = useState("");
+  const pdfInputRef = useRef(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
   const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
   const [overrides, setOverrides] = useState({});
@@ -284,8 +289,49 @@ export default function App() {
     if (months.length) setImportTargetMonth(months[months.length - 1].id);
   }
 
+  async function processPdf(file, password) {
+    setPdfBusy(true);
+    setPdfError("");
+    let pdf;
+    try {
+      // import dinâmico: o pdf.js (~400 KB) só é baixado quando o recurso é usado
+      pdf = await import("./pdfImport");
+      const buffer = await file.arrayBuffer(); // relido a cada tentativa: o worker do pdf.js consome o buffer
+      const text = await pdf.extractPdfText(buffer, password);
+      const items = parseLines(pdf.dropSummaryLines(text), overrides);
+      if (!items.length) {
+        setPdfError("Não encontrei lançamentos nesse PDF. Se for uma fatura escaneada (imagem), o texto não é extraível — nesse caso, cole os lançamentos manualmente.");
+        return;
+      }
+      setPdfPendingFile(null);
+      setPdfPassword("");
+      setReviewItems(items);
+      if (months.length) setImportTargetMonth(months[months.length - 1].id);
+    } catch (err) {
+      if (pdf && err.message === pdf.PDF_PASSWORD_NEEDED) { setPdfPendingFile(file); return; }
+      if (pdf && err.message === pdf.PDF_PASSWORD_WRONG) { setPdfPendingFile(file); setPdfError("Senha incorreta — tente de novo (bancos costumam usar os primeiros dígitos do CPF)."); return; }
+      console.error("Erro ao ler PDF", err);
+      setPdfError("Não consegui ler esse PDF. Você ainda pode colar os lançamentos manualmente.");
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
+  function handlePdfSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // permite re-selecionar o mesmo arquivo
+    if (file) processPdf(file, "");
+  }
+
   function updateReviewCategory(id, category) {
     setReviewItems(prev => prev.map(it => it.id === id ? { ...it, category } : it));
+  }
+
+  function removeReviewItem(id) {
+    setReviewItems(prev => {
+      const next = prev.filter(it => it.id !== id);
+      return next.length ? next : null;
+    });
   }
 
   async function confirmImport() {
@@ -393,9 +439,33 @@ export default function App() {
         <SectionTitle>Classificar lançamentos</SectionTitle>
         <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
           {!showImport && !reviewItems && (
-            <button onClick={() => setShowImport(true)} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, width: "100%", justifyContent: "center" }}>
-              <Sparkles size={16} /> Colar lançamentos da fatura
-            </button>
+            <div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
+                <button onClick={() => setShowImport(true)} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, justifyContent: "center" }}>
+                  <Sparkles size={16} /> Colar lançamentos da fatura
+                </button>
+                <button onClick={() => pdfInputRef.current && pdfInputRef.current.click()} disabled={pdfBusy} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: pdfBusy ? "wait" : "pointer", fontSize: 14, justifyContent: "center", opacity: pdfBusy ? 0.6 : 1 }}>
+                  <FileUp size={16} /> {pdfBusy ? "Lendo PDF..." : "Enviar PDF da fatura"}
+                </button>
+                <input ref={pdfInputRef} type="file" accept="application/pdf,.pdf" onChange={handlePdfSelected} style={{ display: "none" }} />
+              </div>
+              {pdfPendingFile && (
+                <div className="sans" style={{ marginTop: 12, background: C.surfaceAlt, border: `1px solid ${C.line}`, borderRadius: 6, padding: "12px 14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 8 }}>
+                    <Lock size={14} color={C.gold} /> Este PDF é protegido por senha ({pdfPendingFile.name}). A senha é usada só aqui no seu navegador.
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <input type="password" value={pdfPassword} onChange={e => setPdfPassword(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && pdfPassword) processPdf(pdfPendingFile, pdfPassword); }} placeholder="Senha do PDF" style={{ maxWidth: 200 }} />
+                    <button onClick={() => processPdf(pdfPendingFile, pdfPassword)} disabled={pdfBusy || !pdfPassword} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "8px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Abrir</button>
+                    <button onClick={() => { setPdfPendingFile(null); setPdfPassword(""); setPdfError(""); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "8px 14px", borderRadius: 6, fontSize: 13, cursor: "pointer" }}>Cancelar</button>
+                  </div>
+                </div>
+              )}
+              {pdfError && <div className="sans" style={{ marginTop: 10, fontSize: 12.5, color: C.red }}>{pdfError}</div>}
+              <div className="sans" style={{ marginTop: 10, fontSize: 11.5, color: C.textFaint }}>
+                O PDF é lido inteiramente no seu navegador — nenhum dado sai do seu dispositivo.
+              </div>
+            </div>
           )}
           {showImport && !reviewItems && (
             <div>
@@ -413,7 +483,7 @@ export default function App() {
               </div>
               <div style={{ maxHeight: 340, overflowY: "auto", border: `1px solid ${C.line}`, borderRadius: 6 }}>
                 {reviewItems.map(it => (
-                  <div key={it.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "center", padding: "8px 10px", borderBottom: `1px solid ${C.line}` }} className="sans">
+                  <div key={it.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto auto", gap: 8, alignItems: "center", padding: "8px 10px", borderBottom: `1px solid ${C.line}` }} className="sans">
                     <div style={{ minWidth: 0 }}>
                       <div style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.desc}</div>
                       <div className="num" style={{ fontSize: 11, color: C.textFaint }}>{currency(it.value)}</div>
@@ -422,6 +492,9 @@ export default function App() {
                     <select value={it.category} onChange={e => updateReviewCategory(it.id, e.target.value)} style={{ fontSize: 12, padding: "5px 6px", color: CAT_COLOR[it.category] }}>
                       {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
+                    <button onClick={() => removeReviewItem(it.id)} aria-label={`Descartar ${it.desc}`} title="Descartar este lançamento" style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}>
+                      <X size={13} color={C.textFaint} />
+                    </button>
                   </div>
                 ))}
               </div>
