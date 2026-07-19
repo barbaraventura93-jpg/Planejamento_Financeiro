@@ -1,8 +1,16 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
+import { ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target, FileUp, Lock } from "lucide-react";
 import { supabase } from "./supabaseClient";
 import { buildDiagnostics } from "./advisor";
+import { sortMonths } from "./monthOrder";
+
+const NEW_FATURA = "__nova__";
+const MONTH_SHORT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+function suggestMonthLabel() {
+  const now = new Date();
+  return `${MONTH_SHORT[now.getMonth()]}/${now.getFullYear()}`;
+}
 
 const C = {
   bg: "#12151C", surface: "#1B1F29", surfaceAlt: "#212633", line: "#2B3140",
@@ -154,6 +162,7 @@ export default function App() {
   const [pdfError, setPdfError] = useState("");
   const pdfInputRef = useRef(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
+  const [importNewLabel, setImportNewLabel] = useState("");
   const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
   const [overrides, setOverrides] = useState({});
   const [errorMsg, setErrorMsg] = useState("");
@@ -179,11 +188,11 @@ export default function App() {
     const { data: overrideRows, error: overridesErr } = await supabase.from("categoria_overrides").select("*").eq("user_id", userId);
     if (overridesErr) reportError("Erro ao carregar correções aprendidas", overridesErr);
     if (faturas) {
-      setMonths(faturas.map(f => {
+      setMonths(sortMonths(faturas.map(f => {
         const byCategory = {};
         (f.lancamentos || []).forEach(l => { byCategory[l.category] = (byCategory[l.category] || 0) + Number(l.value); });
         return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), bankBalance: f.bank_balance === null || f.bank_balance === undefined ? null : Number(f.bank_balance), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
-      }));
+      })));
     }
     if (cfg) { setConfig(cfg); setIncomeInput(String(cfg.monthly_income ?? "")); }
     if (overrideRows) setOverrides(Object.fromEntries(overrideRows.map(r => [r.pattern, r.category])));
@@ -194,7 +203,18 @@ export default function App() {
     loadData(session.user.id);
   }, [session, loadData]);
 
-  const chartData = useMemo(() => months.map(m => ({ name: m.label.split(" ")[0], Total: Math.round(m.total), Parcelado: Math.round(m.installmentsCommitted || 0) })), [months]);
+  const activeCats = useMemo(() => CATEGORIES.filter(c => months.some(m => (m.byCategory || {})[c] > 0)), [months]);
+  const chartData = useMemo(() => months.map(m => {
+    const row = { name: m.label.split(" ")[0], Parcelado: Math.round(m.installmentsCommitted || 0) };
+    let catSum = 0;
+    for (const c of activeCats) {
+      const v = Math.round((m.byCategory || {})[c] || 0);
+      if (v > 0) { row[c] = v; catSum += v; }
+    }
+    const rest = Math.round(m.total) - catSum;
+    if (rest > 0) row["Não classificado"] = rest;
+    return row;
+  }), [months, activeCats]);
   const avgTotal = useMemo(() => months.length ? months.reduce((a, m) => a + m.total, 0) / months.length : 0, [months]);
   const avgInstallment = useMemo(() => months.length ? months.reduce((a, m) => a + (m.installmentsCommitted || 0), 0) / months.length : 0, [months]);
   const progress = config.emergency_goal ? Math.min(100, (config.emergency_saved / config.emergency_goal) * 100) : 0;
@@ -283,10 +303,16 @@ export default function App() {
     loadData(session.user.id);
   }
 
+  function startReview(items) {
+    setReviewItems(items);
+    setImportNewLabel(suggestMonthLabel());
+    // padrão: criar fatura nova (o caso típico é importar a fatura que acabou de chegar)
+    setImportTargetMonth(NEW_FATURA);
+  }
+
   function runClassification() {
     const items = parseLines(importRaw, overrides);
-    setReviewItems(items);
-    if (months.length) setImportTargetMonth(months[months.length - 1].id);
+    if (items.length) startReview(items);
   }
 
   async function processPdf(file, password) {
@@ -305,8 +331,7 @@ export default function App() {
       }
       setPdfPendingFile(null);
       setPdfPassword("");
-      setReviewItems(items);
-      if (months.length) setImportTargetMonth(months[months.length - 1].id);
+      startReview(items);
     } catch (err) {
       if (pdf && err.message === pdf.PDF_PASSWORD_NEEDED) { setPdfPendingFile(file); return; }
       if (pdf && err.message === pdf.PDF_PASSWORD_WRONG) { setPdfPendingFile(file); setPdfError("Senha incorreta — tente de novo (bancos costumam usar os primeiros dígitos do CPF)."); return; }
@@ -334,10 +359,21 @@ export default function App() {
     });
   }
 
+  const reviewSum = useMemo(() => (reviewItems || []).reduce((a, it) => a + it.value, 0), [reviewItems]);
+  const canConfirmImport = !!reviewItems && (importTargetMonth === NEW_FATURA ? importNewLabel.trim() !== "" : importTargetMonth !== "");
+
   async function confirmImport() {
-    if (!reviewItems || !importTargetMonth || !session) return;
+    if (!reviewItems || !session || !canConfirmImport) return;
+    let targetId = importTargetMonth;
+    if (targetId === NEW_FATURA) {
+      const { data, error } = await supabase.from("faturas").insert({
+        user_id: session.user.id, label: importNewLabel.trim(), total: reviewSum,
+      }).select().single();
+      if (error || !data) { reportError("Erro ao criar a fatura", error); return; }
+      targetId = data.id;
+    }
     const rows = reviewItems.map(it => ({
-      fatura_id: importTargetMonth, user_id: session.user.id, description: it.desc, value: it.value, category: it.category, confidence: it.confidence,
+      fatura_id: targetId, user_id: session.user.id, description: it.desc, value: it.value, category: it.category, confidence: it.confidence,
     }));
     const { error } = await supabase.from("lancamentos").insert(rows);
     if (error) { reportError("Erro ao importar lançamentos", error); return; }
@@ -423,17 +459,21 @@ export default function App() {
 
         <SectionTitle>Evolução das faturas</SectionTitle>
         <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: "18px 12px 8px", marginBottom: 28 }}>
-          <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={chartData} margin={{ top: 4, right: 12, left: -12, bottom: 0 }}>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart data={chartData} margin={{ top: 4, right: 12, left: -12, bottom: 0 }}>
               <CartesianGrid stroke={C.line} vertical={false} />
               <XAxis dataKey="name" tick={{ fill: C.textDim, fontSize: 12 }} axisLine={{ stroke: C.line }} tickLine={false} />
               <YAxis tick={{ fill: C.textDim, fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${(v / 1000).toFixed(0)}k`} />
               <Tooltip contentStyle={{ background: C.surfaceAlt, border: `1px solid ${C.line}`, borderRadius: 6, fontSize: 12.5 }} labelStyle={{ color: C.text }} formatter={(v) => currency(v)} />
-              <Legend wrapperStyle={{ fontSize: 12, color: C.textDim }} />
-              <Bar dataKey="Total" fill={C.gold} radius={[3, 3, 0, 0]} />
-              <Bar dataKey="Parcelado" fill={C.textFaint} radius={[3, 3, 0, 0]} />
-            </BarChart>
+              <Legend wrapperStyle={{ fontSize: 11, color: C.textDim }} />
+              {activeCats.map(cat => <Bar key={cat} dataKey={cat} stackId="cat" fill={CAT_COLOR[cat]} />)}
+              <Bar dataKey="Não classificado" stackId="cat" fill={C.textFaint} />
+              <Line type="monotone" dataKey="Parcelado" stroke={C.amber} strokeWidth={2} strokeDasharray="5 3" dot={{ r: 3, fill: C.amber }} />
+            </ComposedChart>
           </ResponsiveContainer>
+          <div className="sans" style={{ fontSize: 11.5, color: C.textFaint, padding: "0 6px 10px" }}>
+            Barras empilhadas por categoria (cinza = parte da fatura sem lançamentos classificados) · linha tracejada = parcelamento comprometido.
+          </div>
         </div>
 
         <SectionTitle>Classificar lançamentos</SectionTitle>
@@ -478,8 +518,11 @@ export default function App() {
           )}
           {reviewItems && (
             <div>
-              <div className="sans" style={{ fontSize: 12.5, color: C.textDim, marginBottom: 12 }}>
-                {reviewItems.length} lançamentos · {reviewItems.filter(i => i.confidence === "baixa").length} com confiança baixa (revise).
+              <div className="sans" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+                <span style={{ fontSize: 12.5, color: C.textDim }}>
+                  {reviewItems.length} lançamentos · {reviewItems.filter(i => i.confidence === "baixa").length} com confiança baixa (revise).
+                </span>
+                <span className="num" style={{ fontSize: 14, color: C.gold }}>Soma: {currency(reviewSum)}</span>
               </div>
               <div style={{ maxHeight: 340, overflowY: "auto", border: `1px solid ${C.line}`, borderRadius: 6 }}>
                 {reviewItems.map(it => (
@@ -499,14 +542,36 @@ export default function App() {
                 ))}
               </div>
               <label className="sans" style={{ fontSize: 12.5, color: C.textDim, display: "block", marginTop: 14 }}>
-                Somar à fatura:
+                Destino dos lançamentos:
                 <select value={importTargetMonth} onChange={e => setImportTargetMonth(e.target.value)} style={{ marginTop: 6 }}>
-                  {months.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                  <option value={NEW_FATURA}>➕ Criar nova fatura</option>
+                  {months.map(m => <option key={m.id} value={m.id}>Somar à fatura {m.label}</option>)}
                 </select>
               </label>
-              <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-                <button onClick={confirmImport} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "9px 16px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Confirmar e somar</button>
+              {importTargetMonth === NEW_FATURA ? (
+                <div className="sans" style={{ marginTop: 10 }}>
+                  <label style={{ fontSize: 12.5, color: C.textDim, display: "block" }}>
+                    Mês da nova fatura
+                    <input type="text" value={importNewLabel} onChange={e => setImportNewLabel(e.target.value)} placeholder="ex: Jul/2026" style={{ marginTop: 6, maxWidth: 200 }} />
+                  </label>
+                  <div style={{ fontSize: 11.5, color: C.textFaint, marginTop: 6 }}>
+                    A fatura será criada com total de {currency(reviewSum)} — confira se bate com o valor do PDF antes de confirmar.
+                  </div>
+                </div>
+              ) : (
+                (() => {
+                  const target = months.find(m => m.id === importTargetMonth);
+                  return target ? (
+                    <div className="sans" style={{ fontSize: 11.5, color: C.textFaint, marginTop: 8 }}>
+                      A fatura {target.label} está registrada com total de {currency(target.total)}; estes lançamentos somam {currency(reviewSum)} (o total registrado não muda — eles entram como detalhamento).
+                    </div>
+                  ) : null;
+                })()
+              )}
+              <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 14, flexWrap: "wrap" }}>
+                <button onClick={confirmImport} disabled={!canConfirmImport} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "9px 16px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: canConfirmImport ? "pointer" : "not-allowed", opacity: canConfirmImport ? 1 : 0.45 }}>Confirmar e somar</button>
                 <button onClick={() => { setReviewItems(null); setImportRaw(""); setShowImport(false); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "9px 16px", borderRadius: 6, fontSize: 13, cursor: "pointer" }}>Descartar</button>
+                {!canConfirmImport && <span className="sans" style={{ fontSize: 11.5, color: C.amber }}>Preencha o mês da nova fatura (ou escolha uma existente) pra habilitar.</span>}
               </div>
             </div>
           )}
