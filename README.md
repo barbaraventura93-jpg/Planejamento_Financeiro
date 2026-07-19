@@ -70,26 +70,20 @@ igual, isso aqui só automatiza o que vier depois.
 
 ### 5.1 Configurar uma vez (por projeto Supabase)
 
-1. Instale o Supabase CLI localmente só pra fazer esse setup inicial (não precisa depois):
-   ```bash
-   npx supabase login
-   ```
-   Isso abre o navegador pra gerar um **access token** — guarde esse token.
-2. Pegue o **project ref** do seu projeto: Supabase → **Project Settings → General** → "Reference ID".
-3. Rode, na raiz do repositório:
-   ```bash
-   npx supabase link --project-ref SEU_PROJECT_REF
-   ```
-   Vai pedir a senha do banco (a mesma que você definiu ao criar o projeto Supabase).
-4. Como o schema básico (`0001_init.sql`) já está rodando no seu projeto desde o passo 2
-   (você colou na mão), diga ao CLI que essa migration já foi aplicada, sem executá-la de novo:
-   ```bash
-   npx supabase migration repair --status applied 0001
-   ```
-5. No GitHub, vá em **Settings → Secrets and variables → Actions** e adicione 3 secrets:
-   - `SUPABASE_ACCESS_TOKEN` — o token gerado no passo 1
-   - `SUPABASE_DB_PASSWORD` — a senha do banco do passo 3
-   - `SUPABASE_PROJECT_REF` — o project ref do passo 2
+Não precisa instalar nada localmente — o workflow faz tudo (link, marcar a baseline como já
+aplicada e aplicar o resto) sozinho no GitHub. Só precisa cadastrar 3 valores:
+
+1. **Access token**: [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens) →
+   **Generate new token** → copie o valor na hora (só aparece uma vez) → esse é o `SUPABASE_ACCESS_TOKEN`.
+2. **Senha do banco**: a que você definiu ao criar o projeto. Esqueceu? Em **Project Settings → Database →
+   Reset database password** → esse é o `SUPABASE_DB_PASSWORD`.
+3. **Project ref**: em **Project Settings → General → Reference ID** → esse é o `SUPABASE_PROJECT_REF`.
+
+Cadastre os 3 no GitHub em **Settings → Secrets and variables → Actions**. Dá pra cadastrar
+como *Repository secret* (sem environment) ou dentro de um *Environment* — os dois funcionam,
+só precisa que o nome do environment usado no cadastro bata com o `environment:` declarado em
+`.github/workflows/supabase-deploy.yml` (por padrão, o arquivo já está configurado pra ler do
+environment `SUPABASE_ACCESS_TOKEN` — ajuste esse nome no arquivo se você usar outro).
 
 ### 5.2 No dia a dia
 
