@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail } from "lucide-react";
+import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target } from "lucide-react";
 import { supabase } from "./supabaseClient";
+import { buildDiagnostics } from "./advisor";
 
 const C = {
   bg: "#12151C", surface: "#1B1F29", surfaceAlt: "#212633", line: "#2B3140",
@@ -30,7 +31,13 @@ const RULES = [
   [/mercadolivre|mercado\s?pago|paypal|app\s?\*|jim\.com/i, "Diversos", "baixa"],
 ];
 
-function classify(description) {
+function normalizePattern(description) {
+  return (description || "").trim().toUpperCase();
+}
+
+function classify(description, overrides = {}) {
+  const learned = overrides[normalizePattern(description)];
+  if (learned) return { category: learned, confidence: "aprendida" };
   const d = (description || "").toUpperCase();
   for (const [re, cat, conf] of RULES) if (re.test(d)) return { category: cat, confidence: conf };
   return { category: "Diversos", confidence: "baixa" };
@@ -42,7 +49,7 @@ function parseValue(line) {
   return parseFloat(matches[matches.length - 1].replace(/\./g, "").replace(",", "."));
 }
 
-function parseLines(raw) {
+function parseLines(raw, overrides = {}) {
   const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
   const items = [];
   for (const line of lines) {
@@ -50,20 +57,39 @@ function parseLines(raw) {
     if (value === null || value === 0) continue;
     let desc = line.replace(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g, "").replace(/^\d{2}\/\d{2}\s*/, "").replace(/\d{2}\/\d{2}$/, "").trim();
     if (!desc) desc = line;
-    const { category, confidence } = classify(desc);
-    items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, confidence });
+    const { category, confidence } = classify(desc, overrides);
+    items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, autoCategory: category, confidence });
   }
   return items;
 }
 
-const SUBS = [
-  { name: "Netflify/Netflix", est: 46.71 },
-  { name: "Amazon Prime (BR + Canais + Aluguel + Ad-free)", est: 76.60 },
-  { name: "Google One (aparece 2x na mesma fatura)", est: 29.49 },
-  { name: "McAfee", est: 49.68 },
-  { name: "Alura", est: 109.00 },
-  { name: "PetLove Clube", est: 9.99 },
-];
+function toCSV(months) {
+  const rows = [["Mês", "Total", "Comprometido em parcelas", "Rotativo", "Categoria", "Descrição", "Valor"]];
+  for (const m of months) {
+    if (m.lineItems && m.lineItems.length) {
+      for (const li of m.lineItems) {
+        rows.push([m.label, m.total, m.installmentsCommitted || 0, m.revolvingUsed ? "sim" : "não", li.category, li.description, li.value]);
+      }
+    } else {
+      rows.push([m.label, m.total, m.installmentsCommitted || 0, m.revolvingUsed ? "sim" : "não", "", "", ""]);
+    }
+  }
+  return rows.map(r => r.map(v => {
+    const s = String(v ?? "");
+    return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(";")).join("\n");
+}
+
+function downloadCSV(months) {
+  const csv = "﻿" + toCSV(months);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `mesa-financeiro-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const IDEAS = [
   { t: "Fixo x variável", d: "Separar o que se repete todo mês no mesmo valor (assinaturas, parcelas) do que varia mostra quanto do orçamento é realmente flexível." },
@@ -123,7 +149,16 @@ export default function App() {
   const [importRaw, setImportRaw] = useState("");
   const [reviewItems, setReviewItems] = useState(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
-  const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+  const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+  const [overrides, setOverrides] = useState({});
+  const [errorMsg, setErrorMsg] = useState("");
+  const [incomeInput, setIncomeInput] = useState("");
+
+  function reportError(context, error) {
+    if (!error) return;
+    console.error(context, error);
+    setErrorMsg(`${context}: ${error.message || "erro desconhecido"}`);
+  }
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -132,16 +167,21 @@ export default function App() {
   }, []);
 
   const loadData = useCallback(async (userId) => {
-    const { data: faturas } = await supabase.from("faturas").select("*, lancamentos(*)").eq("user_id", userId).order("created_at");
-    const { data: cfg } = await supabase.from("financeiro_config").select("*").eq("user_id", userId).maybeSingle();
+    const { data: faturas, error: faturasErr } = await supabase.from("faturas").select("*, lancamentos(*)").eq("user_id", userId).order("created_at");
+    if (faturasErr) reportError("Erro ao carregar faturas", faturasErr);
+    const { data: cfg, error: cfgErr } = await supabase.from("financeiro_config").select("*").eq("user_id", userId).maybeSingle();
+    if (cfgErr) reportError("Erro ao carregar configuração", cfgErr);
+    const { data: overrideRows, error: overridesErr } = await supabase.from("categoria_overrides").select("*").eq("user_id", userId);
+    if (overridesErr) reportError("Erro ao carregar correções aprendidas", overridesErr);
     if (faturas) {
       setMonths(faturas.map(f => {
         const byCategory = {};
         (f.lancamentos || []).forEach(l => { byCategory[l.category] = (byCategory[l.category] || 0) + Number(l.value); });
-        return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
+        return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), bankBalance: f.bank_balance === null || f.bank_balance === undefined ? null : Number(f.bank_balance), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
       }));
     }
-    if (cfg) setConfig(cfg);
+    if (cfg) { setConfig(cfg); setIncomeInput(String(cfg.monthly_income ?? "")); }
+    if (overrideRows) setOverrides(Object.fromEntries(overrideRows.map(r => [r.pattern, r.category])));
   }, []);
 
   useEffect(() => {
@@ -152,40 +192,94 @@ export default function App() {
   const chartData = useMemo(() => months.map(m => ({ name: m.label.split(" ")[0], Total: Math.round(m.total), Parcelado: Math.round(m.installmentsCommitted || 0) })), [months]);
   const avgTotal = useMemo(() => months.length ? months.reduce((a, m) => a + m.total, 0) / months.length : 0, [months]);
   const avgInstallment = useMemo(() => months.length ? months.reduce((a, m) => a + (m.installmentsCommitted || 0), 0) / months.length : 0, [months]);
-  const installmentShare = avgTotal ? (avgInstallment / avgTotal) * 100 : 0;
   const progress = config.emergency_goal ? Math.min(100, (config.emergency_saved / config.emergency_goal) * 100) : 0;
   const leftover = (config.monthly_income || 0) - avgTotal;
   const savingsRate = config.monthly_income ? (leftover / config.monthly_income) * 100 : null;
 
+  const diagnostics = useMemo(() => buildDiagnostics({ months, config }), [months, config]);
+
+  const subscriptions = useMemo(() => {
+    const byPattern = {};
+    for (const m of months) {
+      for (const li of m.lineItems || []) {
+        if (li.category !== "Assinaturas") continue;
+        const key = normalizePattern(li.description);
+        if (!byPattern[key]) byPattern[key] = { name: li.description, total: 0, count: 0 };
+        byPattern[key].total += Number(li.value);
+        byPattern[key].count += 1;
+      }
+    }
+    return Object.values(byPattern)
+      .map(s => ({ name: s.name, est: s.total / s.count }))
+      .sort((a, b) => b.est - a.est);
+  }, [months]);
+
   async function saveConfig(patch) {
     const next = { ...config, ...patch };
     setConfig(next);
-    await supabase.from("financeiro_config").upsert({ user_id: session.user.id, ...next });
+    const { error } = await supabase.from("financeiro_config").upsert({ user_id: session.user.id, ...next });
+    reportError("Erro ao salvar configuração", error);
+  }
+
+  // debounce: só grava a renda no Supabase depois que o usuário para de digitar
+  useEffect(() => {
+    if (session === null || session === undefined) return;
+    const parsed = parseFloat(incomeInput) || 0;
+    if (parsed === (config.monthly_income || 0)) return;
+    const t = setTimeout(() => { saveConfig({ monthly_income: parsed }); }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incomeInput]);
+
+  async function upsertOverride(pattern, category) {
+    if (!pattern) return;
+    setOverrides(prev => ({ ...prev, [pattern]: category }));
+    const { error } = await supabase.from("categoria_overrides").upsert({ user_id: session.user.id, pattern, category }, { onConflict: "user_id,pattern" });
+    reportError("Erro ao salvar correção de categoria", error);
   }
 
   async function addMonth() {
     if (!form.label || !form.total || !session) return;
-    const { data, error } = await supabase.from("faturas").insert({
+    const payload = {
       user_id: session.user.id, label: form.label, total: parseFloat(form.total),
       installments_committed: parseFloat(form.installmentsCommitted || 0), revolving_used: form.revolvingUsed, notes: form.notes,
-    }).select().single();
-    if (error || !data) return;
+    };
+    if (form.bankBalance !== "") payload.bank_balance = parseFloat(form.bankBalance);
+    const { data, error } = await supabase.from("faturas").insert(payload).select().single();
+    if (error || !data) { reportError("Erro ao salvar fatura", error); return; }
     const catRows = Object.entries(form.byCategory).filter(([, v]) => v).map(([cat, v]) => ({
       fatura_id: data.id, user_id: session.user.id, description: "Ajuste manual", value: parseFloat(v), category: cat, confidence: "manual",
     }));
-    if (catRows.length) await supabase.from("lancamentos").insert(catRows);
-    setForm({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+    if (catRows.length) {
+      const { error: catErr } = await supabase.from("lancamentos").insert(catRows);
+      reportError("Erro ao salvar categorias da fatura", catErr);
+    }
+    setForm({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
     setShowForm(false);
     loadData(session.user.id);
   }
 
   async function removeMonth(id) {
-    await supabase.from("faturas").delete().eq("id", id);
+    const { error } = await supabase.from("faturas").delete().eq("id", id);
+    if (error) { reportError("Erro ao remover fatura", error); return; }
     setMonths(prev => prev.filter(m => m.id !== id));
   }
 
+  async function removeLineItem(lineItemId) {
+    const { error } = await supabase.from("lancamentos").delete().eq("id", lineItemId);
+    if (error) { reportError("Erro ao remover lançamento", error); return; }
+    loadData(session.user.id);
+  }
+
+  async function updateLineItemCategory(lineItem, category) {
+    const { error } = await supabase.from("lancamentos").update({ category }).eq("id", lineItem.id);
+    if (error) { reportError("Erro ao atualizar categoria do lançamento", error); return; }
+    await upsertOverride(normalizePattern(lineItem.description), category);
+    loadData(session.user.id);
+  }
+
   function runClassification() {
-    const items = parseLines(importRaw);
+    const items = parseLines(importRaw, overrides);
     setReviewItems(items);
     if (months.length) setImportTargetMonth(months[months.length - 1].id);
   }
@@ -199,7 +293,10 @@ export default function App() {
     const rows = reviewItems.map(it => ({
       fatura_id: importTargetMonth, user_id: session.user.id, description: it.desc, value: it.value, category: it.category, confidence: it.confidence,
     }));
-    await supabase.from("lancamentos").insert(rows);
+    const { error } = await supabase.from("lancamentos").insert(rows);
+    if (error) { reportError("Erro ao importar lançamentos", error); return; }
+    const corrections = reviewItems.filter(it => it.category !== it.autoCategory);
+    for (const it of corrections) await upsertOverride(normalizePattern(it.desc), it.category);
     setReviewItems(null);
     setImportRaw("");
     setShowImport(false);
@@ -238,11 +335,19 @@ export default function App() {
 
       <main style={{ maxWidth: 880, margin: "0 auto", padding: "28px 20px 60px" }}>
 
-        <div style={{ background: C.surface, border: `1px solid ${C.goldDim}`, borderLeft: `3px solid ${C.gold}`, borderRadius: 6, padding: "16px 18px", marginBottom: 24, display: "flex", gap: 14 }}>
-          <AlertTriangle size={20} color={C.gold} style={{ flexShrink: 0, marginTop: 2 }} />
-          <div className="sans" style={{ fontSize: 13.5, lineHeight: 1.6 }}>
-            Em média <strong className="num">{installmentShare.toFixed(0)}%</strong> do valor de cada fatura registrada é parcelamento já comprometido de compras anteriores.
+        {errorMsg && (
+          <div className="sans" style={{ background: C.redDim, border: `1px solid ${C.red}`, borderRadius: 6, padding: "12px 14px", marginBottom: 20, display: "flex", gap: 10, alignItems: "flex-start", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", gap: 10 }}>
+              <AlertTriangle size={16} color={C.red} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span style={{ fontSize: 13, color: C.text }}>{errorMsg}</span>
+            </div>
+            <button onClick={() => setErrorMsg("")} aria-label="Fechar aviso" style={{ background: "none", border: "none", cursor: "pointer", flexShrink: 0 }}><X size={15} color={C.textDim} /></button>
           </div>
+        )}
+
+        <SectionTitle>Diagnóstico do consultor</SectionTitle>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 28 }}>
+          {diagnostics.map((d, i) => <AdvisorItem key={i} d={d} />)}
         </div>
 
         <SectionTitle>Renda e taxa de poupança</SectionTitle>
@@ -250,7 +355,7 @@ export default function App() {
           <div className="sans" style={{ marginBottom: 14 }}>
             <label style={{ fontSize: 13, color: C.textDim }}>
               Renda líquida mensal
-              <input type="number" value={config.monthly_income || ""} onChange={e => saveConfig({ monthly_income: parseFloat(e.target.value) || 0 })} placeholder="0,00" style={{ marginTop: 6, maxWidth: 220 }} />
+              <input type="number" value={incomeInput} onChange={e => setIncomeInput(e.target.value)} placeholder="0,00" style={{ marginTop: 6, maxWidth: 220 }} />
             </label>
           </div>
           {config.monthly_income > 0 ? (
@@ -353,17 +458,30 @@ export default function App() {
 
         <SectionTitle>Assinaturas identificadas</SectionTitle>
         <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 4, marginBottom: 28 }}>
-          {SUBS.map((s, i) => (
-            <div key={i} className="sans" style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: i < SUBS.length - 1 ? `1px solid ${C.line}` : "none", fontSize: 13.5 }}>
+          {subscriptions.length === 0 && (
+            <div className="sans" style={{ padding: "12px 14px", fontSize: 12.5, color: C.textFaint, fontStyle: "italic" }}>
+              Nenhuma assinatura identificada ainda — lançamentos classificados como "Assinaturas" aparecem aqui.
+            </div>
+          )}
+          {subscriptions.map((s, i) => (
+            <div key={s.name} className="sans" style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: i < subscriptions.length - 1 ? `1px solid ${C.line}` : "none", fontSize: 13.5 }}>
               <span>{s.name}</span><span className="num" style={{ color: C.textDim }}>~{currency(s.est)}/mês</span>
             </div>
           ))}
         </div>
 
-        <SectionTitle>Faturas registradas</SectionTitle>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "0 0 12px" }}>
+          <span style={{ fontSize: 15, color: C.gold, letterSpacing: "0.02em" }}>Faturas registradas</span>
+          {months.length > 0 && (
+            <button onClick={() => downloadCSV(months)} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "5px 10px", borderRadius: 6, fontSize: 12, cursor: "pointer" }}>
+              Exportar CSV
+            </button>
+          )}
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
           {months.slice().reverse().map(m => (
-            <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)} onRemove={() => removeMonth(m.id)} />
+            <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)}
+              onRemove={() => removeMonth(m.id)} onRemoveLineItem={removeLineItem} onUpdateLineItemCategory={updateLineItemCategory} />
           ))}
           {months.length === 0 && <div className="sans" style={{ color: C.textFaint, fontSize: 13, fontStyle: "italic" }}>Nenhuma fatura ainda — adicione a primeira abaixo.</div>}
         </div>
@@ -382,6 +500,7 @@ export default function App() {
               <Field label="Mês (ex: Jul/2026)"><input type="text" value={form.label} onChange={e => setForm(f => ({ ...f, label: e.target.value }))} /></Field>
               <Field label="Total da fatura (R$)"><input type="number" value={form.total} onChange={e => setForm(f => ({ ...f, total: e.target.value }))} /></Field>
               <Field label="Comprometido em parcelas (R$)"><input type="number" value={form.installmentsCommitted} onChange={e => setForm(f => ({ ...f, installmentsCommitted: e.target.value }))} /></Field>
+              <Field label="Saldo em conta no fim do mês (R$)"><input type="number" value={form.bankBalance} onChange={e => setForm(f => ({ ...f, bankBalance: e.target.value }))} /></Field>
               <Field label="Caiu no rotativo?">
                 <select value={form.revolvingUsed ? "sim" : "nao"} onChange={e => setForm(f => ({ ...f, revolvingUsed: e.target.value === "sim" }))}>
                   <option value="nao">Não</option><option value="sim">Sim</option>
@@ -413,8 +532,30 @@ export default function App() {
   );
 }
 
+const ADVISOR_TONE = {
+  good: { color: C.green, bg: C.greenDim, label: "Acertando", Icon: Check },
+  warn: { color: C.amber, bg: C.amberDim, label: "Atenção", Icon: AlertTriangle },
+  action: { color: C.gold, bg: C.surfaceAlt, label: "Ajuste sugerido", Icon: Target },
+};
+
+function AdvisorItem({ d }) {
+  const t = ADVISOR_TONE[d.tone] || ADVISOR_TONE.action;
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderLeft: `3px solid ${t.color}`, borderRadius: 6, padding: "13px 16px", display: "flex", gap: 12 }}>
+      <t.Icon size={16} color={t.color} style={{ flexShrink: 0, marginTop: 2 }} />
+      <div className="sans" style={{ minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
+          <span style={{ fontSize: 13.5, color: C.text }}>{d.title}</span>
+          <span style={{ fontSize: 10, background: t.bg, color: t.color, padding: "2px 7px", borderRadius: 10, whiteSpace: "nowrap" }}>{t.label}</span>
+        </div>
+        <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.55 }}>{d.detail}</div>
+      </div>
+    </div>
+  );
+}
+
 function ConfidenceBadge({ level }) {
-  const map = { alta: { bg: C.greenDim, fg: C.green, label: "alta" }, "média": { bg: C.amberDim, fg: C.amber, label: "média" }, baixa: { bg: C.redDim, fg: C.red, label: "revisar" }, manual: { bg: C.surfaceAlt, fg: C.textDim, label: "manual" } };
+  const map = { alta: { bg: C.greenDim, fg: C.green, label: "alta" }, "média": { bg: C.amberDim, fg: C.amber, label: "média" }, baixa: { bg: C.redDim, fg: C.red, label: "revisar" }, manual: { bg: C.surfaceAlt, fg: C.textDim, label: "manual" }, aprendida: { bg: C.greenDim, fg: C.green, label: "aprendida" } };
   const s = map[level] || map.baixa;
   return <span className="sans" style={{ fontSize: 10, background: s.bg, color: s.fg, padding: "3px 7px", borderRadius: 10, whiteSpace: "nowrap" }}>{s.label}</span>;
 }
@@ -453,8 +594,18 @@ function Field({ label, children, small }) {
   );
 }
 
-function MonthCard({ m, expanded, onToggle, onRemove }) {
+function MonthCard({ m, expanded, onToggle, onRemove, onRemoveLineItem, onUpdateLineItemCategory }) {
   const catEntries = Object.entries(m.byCategory || {});
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [showItems, setShowItems] = useState(false);
+
+  function handleRemoveClick(e) {
+    e.stopPropagation();
+    if (!confirmingRemove) { setConfirmingRemove(true); return; }
+    setConfirmingRemove(false);
+    onRemove();
+  }
+
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
       <div onClick={onToggle} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", cursor: "pointer" }}>
@@ -470,6 +621,7 @@ function MonthCard({ m, expanded, onToggle, onRemove }) {
       {expanded && (
         <div className="sans" style={{ padding: "0 16px 16px", fontSize: 13, color: C.textDim, lineHeight: 1.7 }}>
           {m.installmentsCommitted > 0 && <div>Comprometido em parcelas: <span className="num" style={{ color: C.text }}>{currency(m.installmentsCommitted)}</span> ({((m.installmentsCommitted / m.total) * 100).toFixed(0)}% da fatura)</div>}
+          {m.bankBalance !== null && m.bankBalance !== undefined && <div>Saldo em conta no fim do mês: <span className="num" style={{ color: C.text }}>{currency(m.bankBalance)}</span></div>}
           {catEntries.length > 0 && (
             <div style={{ marginTop: 8 }}>
               {catEntries.map(([cat, v]) => (
@@ -480,14 +632,41 @@ function MonthCard({ m, expanded, onToggle, onRemove }) {
             </div>
           )}
           {m.lineItems && m.lineItems.length > 0 && (
-            <div className="sans" style={{ marginTop: 8, fontSize: 11.5, color: C.textFaint }}>
-              <Pencil size={11} style={{ verticalAlign: "-1px", marginRight: 4 }} /> {m.lineItems.length} lançamentos classificados
+            <div style={{ marginTop: 8 }}>
+              <button onClick={(e) => { e.stopPropagation(); setShowItems(s => !s); }} className="sans" style={{ background: "none", border: "none", color: C.textFaint, fontSize: 11.5, cursor: "pointer", padding: 0, display: "flex", alignItems: "center", gap: 4 }}>
+                <Pencil size={11} /> {m.lineItems.length} lançamentos classificados {showItems ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+              </button>
+              {showItems && (
+                <div style={{ marginTop: 8, border: `1px solid ${C.line}`, borderRadius: 6, overflow: "hidden" }}>
+                  {m.lineItems.map(li => (
+                    <div key={li.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "center", padding: "7px 10px", borderBottom: `1px solid ${C.line}` }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.text }}>{li.description}</div>
+                        <div className="num" style={{ fontSize: 10.5, color: C.textFaint }}>{currency(li.value)}</div>
+                      </div>
+                      <select value={li.category} onChange={e => onUpdateLineItemCategory(li, e.target.value)} onClick={e => e.stopPropagation()} style={{ fontSize: 11.5, padding: "4px 5px", color: CAT_COLOR[li.category] }}>
+                        {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <button onClick={(e) => { e.stopPropagation(); onRemoveLineItem(li.id); }} aria-label={`Remover lançamento ${li.description}`} style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}>
+                        <Trash2 size={12} color={C.textFaint} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {m.notes && <div style={{ marginTop: 10, fontStyle: "italic", color: C.textFaint }}>{m.notes}</div>}
-          <button onClick={onRemove} className="sans" style={{ marginTop: 12, background: "none", border: `1px solid ${C.line}`, color: C.textFaint, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
-            <Trash2 size={12} /> Remover
-          </button>
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={handleRemoveClick} className="sans" style={{ background: confirmingRemove ? C.redDim : "none", border: `1px solid ${confirmingRemove ? C.red : C.line}`, color: confirmingRemove ? C.red : C.textFaint, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+              <Trash2 size={12} /> {confirmingRemove ? "Confirmar remoção da fatura?" : "Remover"}
+            </button>
+            {confirmingRemove && (
+              <button onClick={(e) => { e.stopPropagation(); setConfirmingRemove(false); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer" }}>
+                Cancelar
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
