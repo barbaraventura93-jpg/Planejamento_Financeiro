@@ -261,7 +261,7 @@ export default function App() {
     setMonths(prev => prev.filter(m => m.id !== id));
   }
 
-  async function removeLineItem(fatura, lineItemId) {
+  async function removeLineItem(lineItemId) {
     const { error } = await supabase.from("lancamentos").delete().eq("id", lineItemId);
     if (error) { reportError("Erro ao remover lançamento", error); return; }
     loadData(session.user.id);
@@ -479,7 +479,7 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
           {months.slice().reverse().map(m => (
             <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)}
-              onRemove={() => removeMonth(m.id)} onRemoveLineItem={(liId) => removeLineItem(m, liId)} onUpdateLineItemCategory={updateLineItemCategory} />
+              onRemove={() => removeMonth(m.id)} onRemoveLineItem={removeLineItem} onUpdateLineItemCategory={updateLineItemCategory} />
           ))}
           {months.length === 0 && <div className="sans" style={{ color: C.textFaint, fontSize: 13, fontStyle: "italic" }}>Nenhuma fatura ainda — adicione a primeira abaixo.</div>}
         </div>
@@ -530,7 +530,7 @@ export default function App() {
 }
 
 function ConfidenceBadge({ level }) {
-  const map = { alta: { bg: C.greenDim, fg: C.green, label: "alta" }, "média": { bg: C.amberDim, fg: C.amber, label: "média" }, baixa: { bg: C.redDim, fg: C.red, label: "revisar" }, manual: { bg: C.surfaceAlt, fg: C.textDim, label: "manual" } };
+  const map = { alta: { bg: C.greenDim, fg: C.green, label: "alta" }, "média": { bg: C.amberDim, fg: C.amber, label: "média" }, baixa: { bg: C.redDim, fg: C.red, label: "revisar" }, manual: { bg: C.surfaceAlt, fg: C.textDim, label: "manual" }, aprendida: { bg: C.greenDim, fg: C.green, label: "aprendida" } };
   const s = map[level] || map.baixa;
   return <span className="sans" style={{ fontSize: 10, background: s.bg, color: s.fg, padding: "3px 7px", borderRadius: 10, whiteSpace: "nowrap" }}>{s.label}</span>;
 }
@@ -569,8 +569,18 @@ function Field({ label, children, small }) {
   );
 }
 
-function MonthCard({ m, expanded, onToggle, onRemove }) {
+function MonthCard({ m, expanded, onToggle, onRemove, onRemoveLineItem, onUpdateLineItemCategory }) {
   const catEntries = Object.entries(m.byCategory || {});
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [showItems, setShowItems] = useState(false);
+
+  function handleRemoveClick(e) {
+    e.stopPropagation();
+    if (!confirmingRemove) { setConfirmingRemove(true); return; }
+    setConfirmingRemove(false);
+    onRemove();
+  }
+
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
       <div onClick={onToggle} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", cursor: "pointer" }}>
@@ -596,14 +606,41 @@ function MonthCard({ m, expanded, onToggle, onRemove }) {
             </div>
           )}
           {m.lineItems && m.lineItems.length > 0 && (
-            <div className="sans" style={{ marginTop: 8, fontSize: 11.5, color: C.textFaint }}>
-              <Pencil size={11} style={{ verticalAlign: "-1px", marginRight: 4 }} /> {m.lineItems.length} lançamentos classificados
+            <div style={{ marginTop: 8 }}>
+              <button onClick={(e) => { e.stopPropagation(); setShowItems(s => !s); }} className="sans" style={{ background: "none", border: "none", color: C.textFaint, fontSize: 11.5, cursor: "pointer", padding: 0, display: "flex", alignItems: "center", gap: 4 }}>
+                <Pencil size={11} /> {m.lineItems.length} lançamentos classificados {showItems ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+              </button>
+              {showItems && (
+                <div style={{ marginTop: 8, border: `1px solid ${C.line}`, borderRadius: 6, overflow: "hidden" }}>
+                  {m.lineItems.map(li => (
+                    <div key={li.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "center", padding: "7px 10px", borderBottom: `1px solid ${C.line}` }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.text }}>{li.description}</div>
+                        <div className="num" style={{ fontSize: 10.5, color: C.textFaint }}>{currency(li.value)}</div>
+                      </div>
+                      <select value={li.category} onChange={e => onUpdateLineItemCategory(li, e.target.value)} onClick={e => e.stopPropagation()} style={{ fontSize: 11.5, padding: "4px 5px", color: CAT_COLOR[li.category] }}>
+                        {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <button onClick={(e) => { e.stopPropagation(); onRemoveLineItem(li.id); }} aria-label={`Remover lançamento ${li.description}`} style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}>
+                        <Trash2 size={12} color={C.textFaint} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {m.notes && <div style={{ marginTop: 10, fontStyle: "italic", color: C.textFaint }}>{m.notes}</div>}
-          <button onClick={onRemove} className="sans" style={{ marginTop: 12, background: "none", border: `1px solid ${C.line}`, color: C.textFaint, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
-            <Trash2 size={12} /> Remover
-          </button>
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={handleRemoveClick} className="sans" style={{ background: confirmingRemove ? C.redDim : "none", border: `1px solid ${confirmingRemove ? C.red : C.line}`, color: confirmingRemove ? C.red : C.textFaint, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+              <Trash2 size={12} /> {confirmingRemove ? "Confirmar remoção da fatura?" : "Remover"}
+            </button>
+            {confirmingRemove && (
+              <button onClick={(e) => { e.stopPropagation(); setConfirmingRemove(false); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer" }}>
+                Cancelar
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
