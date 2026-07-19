@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
-import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail } from "lucide-react";
+import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target } from "lucide-react";
 import { supabase } from "./supabaseClient";
+import { buildDiagnostics } from "./advisor";
 
 const C = {
   bg: "#12151C", surface: "#1B1F29", surfaceAlt: "#212633", line: "#2B3140",
@@ -148,7 +149,7 @@ export default function App() {
   const [importRaw, setImportRaw] = useState("");
   const [reviewItems, setReviewItems] = useState(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
-  const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+  const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
   const [overrides, setOverrides] = useState({});
   const [errorMsg, setErrorMsg] = useState("");
   const [incomeInput, setIncomeInput] = useState("");
@@ -176,7 +177,7 @@ export default function App() {
       setMonths(faturas.map(f => {
         const byCategory = {};
         (f.lancamentos || []).forEach(l => { byCategory[l.category] = (byCategory[l.category] || 0) + Number(l.value); });
-        return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
+        return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), bankBalance: f.bank_balance === null || f.bank_balance === undefined ? null : Number(f.bank_balance), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
       }));
     }
     if (cfg) { setConfig(cfg); setIncomeInput(String(cfg.monthly_income ?? "")); }
@@ -191,10 +192,11 @@ export default function App() {
   const chartData = useMemo(() => months.map(m => ({ name: m.label.split(" ")[0], Total: Math.round(m.total), Parcelado: Math.round(m.installmentsCommitted || 0) })), [months]);
   const avgTotal = useMemo(() => months.length ? months.reduce((a, m) => a + m.total, 0) / months.length : 0, [months]);
   const avgInstallment = useMemo(() => months.length ? months.reduce((a, m) => a + (m.installmentsCommitted || 0), 0) / months.length : 0, [months]);
-  const installmentShare = avgTotal ? (avgInstallment / avgTotal) * 100 : 0;
   const progress = config.emergency_goal ? Math.min(100, (config.emergency_saved / config.emergency_goal) * 100) : 0;
   const leftover = (config.monthly_income || 0) - avgTotal;
   const savingsRate = config.monthly_income ? (leftover / config.monthly_income) * 100 : null;
+
+  const diagnostics = useMemo(() => buildDiagnostics({ months, config }), [months, config]);
 
   const subscriptions = useMemo(() => {
     const byPattern = {};
@@ -238,10 +240,12 @@ export default function App() {
 
   async function addMonth() {
     if (!form.label || !form.total || !session) return;
-    const { data, error } = await supabase.from("faturas").insert({
+    const payload = {
       user_id: session.user.id, label: form.label, total: parseFloat(form.total),
       installments_committed: parseFloat(form.installmentsCommitted || 0), revolving_used: form.revolvingUsed, notes: form.notes,
-    }).select().single();
+    };
+    if (form.bankBalance !== "") payload.bank_balance = parseFloat(form.bankBalance);
+    const { data, error } = await supabase.from("faturas").insert(payload).select().single();
     if (error || !data) { reportError("Erro ao salvar fatura", error); return; }
     const catRows = Object.entries(form.byCategory).filter(([, v]) => v).map(([cat, v]) => ({
       fatura_id: data.id, user_id: session.user.id, description: "Ajuste manual", value: parseFloat(v), category: cat, confidence: "manual",
@@ -250,7 +254,7 @@ export default function App() {
       const { error: catErr } = await supabase.from("lancamentos").insert(catRows);
       reportError("Erro ao salvar categorias da fatura", catErr);
     }
-    setForm({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+    setForm({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
     setShowForm(false);
     loadData(session.user.id);
   }
@@ -341,11 +345,9 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ background: C.surface, border: `1px solid ${C.goldDim}`, borderLeft: `3px solid ${C.gold}`, borderRadius: 6, padding: "16px 18px", marginBottom: 24, display: "flex", gap: 14 }}>
-          <AlertTriangle size={20} color={C.gold} style={{ flexShrink: 0, marginTop: 2 }} />
-          <div className="sans" style={{ fontSize: 13.5, lineHeight: 1.6 }}>
-            Em média <strong className="num">{installmentShare.toFixed(0)}%</strong> do valor de cada fatura registrada é parcelamento já comprometido de compras anteriores.
-          </div>
+        <SectionTitle>Diagnóstico do consultor</SectionTitle>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 28 }}>
+          {diagnostics.map((d, i) => <AdvisorItem key={i} d={d} />)}
         </div>
 
         <SectionTitle>Renda e taxa de poupança</SectionTitle>
@@ -498,6 +500,7 @@ export default function App() {
               <Field label="Mês (ex: Jul/2026)"><input type="text" value={form.label} onChange={e => setForm(f => ({ ...f, label: e.target.value }))} /></Field>
               <Field label="Total da fatura (R$)"><input type="number" value={form.total} onChange={e => setForm(f => ({ ...f, total: e.target.value }))} /></Field>
               <Field label="Comprometido em parcelas (R$)"><input type="number" value={form.installmentsCommitted} onChange={e => setForm(f => ({ ...f, installmentsCommitted: e.target.value }))} /></Field>
+              <Field label="Saldo em conta no fim do mês (R$)"><input type="number" value={form.bankBalance} onChange={e => setForm(f => ({ ...f, bankBalance: e.target.value }))} /></Field>
               <Field label="Caiu no rotativo?">
                 <select value={form.revolvingUsed ? "sim" : "nao"} onChange={e => setForm(f => ({ ...f, revolvingUsed: e.target.value === "sim" }))}>
                   <option value="nao">Não</option><option value="sim">Sim</option>
@@ -525,6 +528,28 @@ export default function App() {
           ))}
         </div>
       </main>
+    </div>
+  );
+}
+
+const ADVISOR_TONE = {
+  good: { color: C.green, bg: C.greenDim, label: "Acertando", Icon: Check },
+  warn: { color: C.amber, bg: C.amberDim, label: "Atenção", Icon: AlertTriangle },
+  action: { color: C.gold, bg: C.surfaceAlt, label: "Ajuste sugerido", Icon: Target },
+};
+
+function AdvisorItem({ d }) {
+  const t = ADVISOR_TONE[d.tone] || ADVISOR_TONE.action;
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderLeft: `3px solid ${t.color}`, borderRadius: 6, padding: "13px 16px", display: "flex", gap: 12 }}>
+      <t.Icon size={16} color={t.color} style={{ flexShrink: 0, marginTop: 2 }} />
+      <div className="sans" style={{ minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 3 }}>
+          <span style={{ fontSize: 13.5, color: C.text }}>{d.title}</span>
+          <span style={{ fontSize: 10, background: t.bg, color: t.color, padding: "2px 7px", borderRadius: 10, whiteSpace: "nowrap" }}>{t.label}</span>
+        </div>
+        <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.55 }}>{d.detail}</div>
+      </div>
     </div>
   );
 }
@@ -596,6 +621,7 @@ function MonthCard({ m, expanded, onToggle, onRemove, onRemoveLineItem, onUpdate
       {expanded && (
         <div className="sans" style={{ padding: "0 16px 16px", fontSize: 13, color: C.textDim, lineHeight: 1.7 }}>
           {m.installmentsCommitted > 0 && <div>Comprometido em parcelas: <span className="num" style={{ color: C.text }}>{currency(m.installmentsCommitted)}</span> ({((m.installmentsCommitted / m.total) * 100).toFixed(0)}% da fatura)</div>}
+          {m.bankBalance !== null && m.bankBalance !== undefined && <div>Saldo em conta no fim do mês: <span className="num" style={{ color: C.text }}>{currency(m.bankBalance)}</span></div>}
           {catEntries.length > 0 && (
             <div style={{ marginTop: 8 }}>
               {catEntries.map(([cat, v]) => (

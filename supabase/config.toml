@@ -1,0 +1,9 @@
+# Configuração mínima para o Supabase CLI conseguir rodar `supabase link` e
+# `supabase db push` (usados pela automação em .github/workflows/supabase-deploy.yml).
+# Não precisa disso para rodar local nem para colar supabase/schema.sql na mão.
+project_id = "mesa-financeiro"
+
+[db]
+# Versão major do Postgres do seu projeto. Confira em Supabase > Project Settings > Infrastructure,
+# ou rode `select version();` no SQL Editor. Ajuste se for diferente de 15.
+major_version = 15
