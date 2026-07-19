@@ -1,0 +1,6 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# As variáveis VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY devem ser
+# configuradas em: Site settings > Environment variables (não aqui).

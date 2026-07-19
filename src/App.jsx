@@ -1,0 +1,495 @@
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
+import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail } from "lucide-react";
+import { supabase } from "./supabaseClient";
+
+const C = {
+  bg: "#12151C", surface: "#1B1F29", surfaceAlt: "#212633", line: "#2B3140",
+  gold: "#C9A24B", goldDim: "#8A7238", text: "#EDEAE1", textDim: "#9098A8",
+  textFaint: "#5C6473", red: "#D9704F", redDim: "#4A2E27", green: "#7FA97A", greenDim: "#28352A",
+  amber: "#D9B24F", amberDim: "#4A3E27",
+};
+
+const CATEGORIES = ["Moradia", "Alimentação", "Vestuário", "Saúde", "Veículos", "Educação", "Hobby/Pets", "Turismo/Entretenimento", "Assinaturas", "Diversos"];
+const CAT_COLOR = {
+  "Moradia": "#8A9BAE", "Alimentação": "#C9A24B", "Vestuário": "#B98A6B", "Saúde": "#7FA97A",
+  "Veículos": "#6B8CB9", "Educação": "#A98AC9", "Hobby/Pets": "#C97A9B",
+  "Turismo/Entretenimento": "#D9704F", "Assinaturas": "#5CA0A8", "Diversos": "#7C8494"
+};
+
+const RULES = [
+  [/odontolog|drogaria|farmacia|clinica|laborator|hospital|saude|dental|fisioterap|dermato|nutrition|nutri|growthsupple|primeformulas|duxnutriti/i, "Saúde", "alta"],
+  [/petlove|pet\s?shop|petsupermark|racao|veterinari/i, "Hobby/Pets", "alta"],
+  [/alura|hubla|tera\s?trein|udemy|curso|faculdade|escola|educaç/i, "Educação", "alta"],
+  [/avianca|gol\s?linhas|latam|hotel|pousada|booking|airbnb|decolar|turismo|passagem/i, "Turismo/Entretenimento", "alta"],
+  [/netflix|netflify|amazon\s?prime|amazonprimebr|google\s?one|mcafee|spotify|disney|hbo|paramount|youtube\s?premium|microsoft\s?\*store|adobe/i, "Assinaturas", "alta"],
+  [/99food|ifood|rappi|restaurante|lanchonete|padaria|pizzaria|burguer|bar\s|cafe|acai|sushi|churrasc|supermercado|hortifruti|sonda/i, "Alimentação", "média"],
+  [/posto|estacionamento|fccpark|nowpark|pedagio|oficina|auto\s?pe(c|ç)a|pneu|ipva|dpvat|multa|combust/i, "Veículos", "alta"],
+  [/sodimac|telhanorte|condominio|aluguel\s?(de\s?)?(im[oó]vel|casa|apto)|reforma|moveis\s?planejados|imobiliaria/i, "Moradia", "média"],
+  [/shopee|renner|c&a|riachuelo|chilli\s?beans|zara|shein|calcado|vestuario|moda|boutique/i, "Vestuário", "média"],
+  [/mercadolivre|mercado\s?pago|paypal|app\s?\*|jim\.com/i, "Diversos", "baixa"],
+];
+
+function classify(description) {
+  const d = (description || "").toUpperCase();
+  for (const [re, cat, conf] of RULES) if (re.test(d)) return { category: cat, confidence: conf };
+  return { category: "Diversos", confidence: "baixa" };
+}
+
+function parseValue(line) {
+  const matches = line.match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g);
+  if (!matches || matches.length === 0) return null;
+  return parseFloat(matches[matches.length - 1].replace(/\./g, "").replace(",", "."));
+}
+
+function parseLines(raw) {
+  const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
+  const items = [];
+  for (const line of lines) {
+    const value = parseValue(line);
+    if (value === null || value === 0) continue;
+    let desc = line.replace(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g, "").replace(/^\d{2}\/\d{2}\s*/, "").replace(/\d{2}\/\d{2}$/, "").trim();
+    if (!desc) desc = line;
+    const { category, confidence } = classify(desc);
+    items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, confidence });
+  }
+  return items;
+}
+
+const SUBS = [
+  { name: "Netflify/Netflix", est: 46.71 },
+  { name: "Amazon Prime (BR + Canais + Aluguel + Ad-free)", est: 76.60 },
+  { name: "Google One (aparece 2x na mesma fatura)", est: 29.49 },
+  { name: "McAfee", est: 49.68 },
+  { name: "Alura", est: 109.00 },
+  { name: "PetLove Clube", est: 9.99 },
+];
+
+const IDEAS = [
+  { t: "Fixo x variável", d: "Separar o que se repete todo mês no mesmo valor (assinaturas, parcelas) do que varia mostra quanto do orçamento é realmente flexível." },
+  { t: "Cronograma de quitação dos parcelamentos", d: "Ver a data em que cada parcelamento termina mostra quando o fluxo de caixa 'libera' sozinho." },
+  { t: "Limite de crédito utilizado por cartão", d: "Acompanhar isso evita concentrar tudo num cartão só." },
+  { t: "Patrimônio líquido (net worth)", d: "Juntar investimentos (Mesa) + reserva + dívidas parceladas num só número dá visão do progresso real." },
+  { t: "Alerta de reincidência", d: "Sinalizar quando um lojista/categoria volta a aparecer toda semana ajuda a notar padrões de compra por impulso." },
+];
+
+function currency(v) { return (v || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" }); }
+
+// ---------------- Auth gate ----------------
+function AuthScreen() {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+
+  async function sendLink() {
+    setError("");
+    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+    if (error) setError(error.message);
+    else setSent(true);
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Georgia, serif" }}>
+      <div style={{ maxWidth: 340, width: "100%", padding: 24, textAlign: "center" }}>
+        <div className="sans" style={{ fontSize: 11, letterSpacing: "0.18em", color: C.gold, textTransform: "uppercase", marginBottom: 10 }}>Mesa · Financeiro</div>
+        <h1 style={{ fontSize: 24, fontWeight: 400, marginBottom: 20 }}>Entrar</h1>
+        {sent ? (
+          <p className="sans" style={{ fontSize: 13.5, color: C.textDim, lineHeight: 1.6 }}>
+            Link enviado para <strong style={{ color: C.gold }}>{email}</strong>. Abra no celular e ele já te loga aqui.
+          </p>
+        ) : (
+          <>
+            <input type="email" placeholder="seu@email.com" value={email} onChange={e => setEmail(e.target.value)}
+              className="sans" style={{ width: "100%", background: C.surface, border: `1px solid ${C.line}`, color: C.text, padding: "10px 12px", borderRadius: 6, fontSize: 14, marginBottom: 12 }} />
+            <button onClick={sendLink} className="sans" style={{ width: "100%", background: C.gold, color: C.bg, border: "none", padding: "10px 16px", borderRadius: 6, fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+              <Mail size={15} /> Enviar link de acesso
+            </button>
+            {error && <p className="sans" style={{ color: C.red, fontSize: 12, marginTop: 10 }}>{error}</p>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Main app ----------------
+export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = loading, null = logged out
+  const [months, setMonths] = useState([]);
+  const [config, setConfig] = useState({ monthly_income: 0, emergency_goal: 30000, emergency_saved: 0 });
+  const [showForm, setShowForm] = useState(false);
+  const [expanded, setExpanded] = useState(null);
+  const [showImport, setShowImport] = useState(false);
+  const [importRaw, setImportRaw] = useState("");
+  const [reviewItems, setReviewItems] = useState(null);
+  const [importTargetMonth, setImportTargetMonth] = useState("");
+  const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const loadData = useCallback(async (userId) => {
+    const { data: faturas } = await supabase.from("faturas").select("*, lancamentos(*)").eq("user_id", userId).order("created_at");
+    const { data: cfg } = await supabase.from("financeiro_config").select("*").eq("user_id", userId).maybeSingle();
+    if (faturas) {
+      setMonths(faturas.map(f => {
+        const byCategory = {};
+        (f.lancamentos || []).forEach(l => { byCategory[l.category] = (byCategory[l.category] || 0) + Number(l.value); });
+        return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
+      }));
+    }
+    if (cfg) setConfig(cfg);
+  }, []);
+
+  useEffect(() => {
+    if (session === null || session === undefined) return;
+    loadData(session.user.id);
+  }, [session, loadData]);
+
+  const chartData = useMemo(() => months.map(m => ({ name: m.label.split(" ")[0], Total: Math.round(m.total), Parcelado: Math.round(m.installmentsCommitted || 0) })), [months]);
+  const avgTotal = useMemo(() => months.length ? months.reduce((a, m) => a + m.total, 0) / months.length : 0, [months]);
+  const avgInstallment = useMemo(() => months.length ? months.reduce((a, m) => a + (m.installmentsCommitted || 0), 0) / months.length : 0, [months]);
+  const installmentShare = avgTotal ? (avgInstallment / avgTotal) * 100 : 0;
+  const progress = config.emergency_goal ? Math.min(100, (config.emergency_saved / config.emergency_goal) * 100) : 0;
+  const leftover = (config.monthly_income || 0) - avgTotal;
+  const savingsRate = config.monthly_income ? (leftover / config.monthly_income) * 100 : null;
+
+  async function saveConfig(patch) {
+    const next = { ...config, ...patch };
+    setConfig(next);
+    await supabase.from("financeiro_config").upsert({ user_id: session.user.id, ...next });
+  }
+
+  async function addMonth() {
+    if (!form.label || !form.total || !session) return;
+    const { data, error } = await supabase.from("faturas").insert({
+      user_id: session.user.id, label: form.label, total: parseFloat(form.total),
+      installments_committed: parseFloat(form.installmentsCommitted || 0), revolving_used: form.revolvingUsed, notes: form.notes,
+    }).select().single();
+    if (error || !data) return;
+    const catRows = Object.entries(form.byCategory).filter(([, v]) => v).map(([cat, v]) => ({
+      fatura_id: data.id, user_id: session.user.id, description: "Ajuste manual", value: parseFloat(v), category: cat, confidence: "manual",
+    }));
+    if (catRows.length) await supabase.from("lancamentos").insert(catRows);
+    setForm({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+    setShowForm(false);
+    loadData(session.user.id);
+  }
+
+  async function removeMonth(id) {
+    await supabase.from("faturas").delete().eq("id", id);
+    setMonths(prev => prev.filter(m => m.id !== id));
+  }
+
+  function runClassification() {
+    const items = parseLines(importRaw);
+    setReviewItems(items);
+    if (months.length) setImportTargetMonth(months[months.length - 1].id);
+  }
+
+  function updateReviewCategory(id, category) {
+    setReviewItems(prev => prev.map(it => it.id === id ? { ...it, category } : it));
+  }
+
+  async function confirmImport() {
+    if (!reviewItems || !importTargetMonth || !session) return;
+    const rows = reviewItems.map(it => ({
+      fatura_id: importTargetMonth, user_id: session.user.id, description: it.desc, value: it.value, category: it.category, confidence: it.confidence,
+    }));
+    await supabase.from("lancamentos").insert(rows);
+    setReviewItems(null);
+    setImportRaw("");
+    setShowImport(false);
+    loadData(session.user.id);
+  }
+
+  if (session === undefined) return <div style={{ minHeight: "100vh", background: C.bg }} />;
+  if (session === null) return <AuthScreen />;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Georgia', 'Iowan Old Style', serif" }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+        .num { font-variant-numeric: tabular-nums; }
+        input[type=text], input[type=number], textarea, select {
+          background: ${C.bg}; border: 1px solid ${C.line}; color: ${C.text};
+          padding: 8px 10px; border-radius: 4px; font-family: inherit; font-size: 14px; width: 100%;
+        }
+        textarea { font-family: 'SF Mono', Consolas, monospace; font-size: 12.5px; min-height: 120px; resize: vertical; }
+        input:focus, textarea:focus, select:focus { outline: 1px solid ${C.gold}; border-color: ${C.gold}; }
+        button:focus-visible { outline: 2px solid ${C.gold}; outline-offset: 2px; }
+      `}</style>
+
+      <header style={{ borderBottom: `1px solid ${C.line}`, padding: "24px 20px 20px" }}>
+        <div style={{ maxWidth: 880, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div className="sans" style={{ fontSize: 11, letterSpacing: "0.18em", color: C.gold, textTransform: "uppercase", marginBottom: 6 }}>Mesa · Módulo Financeiro</div>
+            <h1 style={{ margin: 0, fontSize: 26, fontWeight: 400 }}>Painel de Faturas</h1>
+          </div>
+          <button onClick={() => supabase.auth.signOut()} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "6px 10px", borderRadius: 6, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+            <LogOut size={13} /> Sair
+          </button>
+        </div>
+      </header>
+
+      <main style={{ maxWidth: 880, margin: "0 auto", padding: "28px 20px 60px" }}>
+
+        <div style={{ background: C.surface, border: `1px solid ${C.goldDim}`, borderLeft: `3px solid ${C.gold}`, borderRadius: 6, padding: "16px 18px", marginBottom: 24, display: "flex", gap: 14 }}>
+          <AlertTriangle size={20} color={C.gold} style={{ flexShrink: 0, marginTop: 2 }} />
+          <div className="sans" style={{ fontSize: 13.5, lineHeight: 1.6 }}>
+            Em média <strong className="num">{installmentShare.toFixed(0)}%</strong> do valor de cada fatura registrada é parcelamento já comprometido de compras anteriores.
+          </div>
+        </div>
+
+        <SectionTitle>Renda e taxa de poupança</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
+          <div className="sans" style={{ marginBottom: 14 }}>
+            <label style={{ fontSize: 13, color: C.textDim }}>
+              Renda líquida mensal
+              <input type="number" value={config.monthly_income || ""} onChange={e => saveConfig({ monthly_income: parseFloat(e.target.value) || 0 })} placeholder="0,00" style={{ marginTop: 6, maxWidth: 220 }} />
+            </label>
+          </div>
+          {config.monthly_income > 0 ? (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+              <MiniStat label="Sobra média/mês" value={currency(leftover)} tone={leftover >= 0 ? "good" : "bad"} />
+              <MiniStat label="Taxa de poupança" value={`${savingsRate.toFixed(0)}%`} tone={savingsRate >= 20 ? "good" : savingsRate >= 0 ? "neutral" : "bad"} />
+              <MiniStat label="Fatura consome" value={`${((avgTotal / config.monthly_income) * 100).toFixed(0)}% da renda`} tone={avgTotal / config.monthly_income > 0.5 ? "bad" : "neutral"} />
+            </div>
+          ) : (
+            <div className="sans" style={{ fontSize: 12.5, color: C.textFaint, fontStyle: "italic" }}>Informe a renda pra ver sua taxa de poupança real.</div>
+          )}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12, marginBottom: 28 }}>
+          <SummaryCard label="Média mensal (fatura total)" value={currency(avgTotal)} icon={<CreditCard size={16} color={C.textDim} />} />
+          <SummaryCard label="Média parcelado/comprometido" value={currency(avgInstallment)} icon={<TrendingUp size={16} color={C.textDim} />} />
+          <SummaryCard label="Meses registrados" value={String(months.length)} icon={<Check size={16} color={C.textDim} />} />
+        </div>
+
+        <SectionTitle>Evolução das faturas</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: "18px 12px 8px", marginBottom: 28 }}>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={chartData} margin={{ top: 4, right: 12, left: -12, bottom: 0 }}>
+              <CartesianGrid stroke={C.line} vertical={false} />
+              <XAxis dataKey="name" tick={{ fill: C.textDim, fontSize: 12 }} axisLine={{ stroke: C.line }} tickLine={false} />
+              <YAxis tick={{ fill: C.textDim, fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={(v) => `${(v / 1000).toFixed(0)}k`} />
+              <Tooltip contentStyle={{ background: C.surfaceAlt, border: `1px solid ${C.line}`, borderRadius: 6, fontSize: 12.5 }} labelStyle={{ color: C.text }} formatter={(v) => currency(v)} />
+              <Legend wrapperStyle={{ fontSize: 12, color: C.textDim }} />
+              <Bar dataKey="Total" fill={C.gold} radius={[3, 3, 0, 0]} />
+              <Bar dataKey="Parcelado" fill={C.textFaint} radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <SectionTitle>Classificar lançamentos</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
+          {!showImport && !reviewItems && (
+            <button onClick={() => setShowImport(true)} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, width: "100%", justifyContent: "center" }}>
+              <Sparkles size={16} /> Colar lançamentos da fatura
+            </button>
+          )}
+          {showImport && !reviewItems && (
+            <div>
+              <textarea value={importRaw} onChange={e => setImportRaw(e.target.value)} placeholder="Cole aqui os lançamentos..." />
+              <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                <button onClick={runClassification} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "9px 16px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Classificar</button>
+                <button onClick={() => { setShowImport(false); setImportRaw(""); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "9px 16px", borderRadius: 6, fontSize: 13, cursor: "pointer" }}>Cancelar</button>
+              </div>
+            </div>
+          )}
+          {reviewItems && (
+            <div>
+              <div className="sans" style={{ fontSize: 12.5, color: C.textDim, marginBottom: 12 }}>
+                {reviewItems.length} lançamentos · {reviewItems.filter(i => i.confidence === "baixa").length} com confiança baixa (revise).
+              </div>
+              <div style={{ maxHeight: 340, overflowY: "auto", border: `1px solid ${C.line}`, borderRadius: 6 }}>
+                {reviewItems.map(it => (
+                  <div key={it.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8, alignItems: "center", padding: "8px 10px", borderBottom: `1px solid ${C.line}` }} className="sans">
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.desc}</div>
+                      <div className="num" style={{ fontSize: 11, color: C.textFaint }}>{currency(it.value)}</div>
+                    </div>
+                    <ConfidenceBadge level={it.confidence} />
+                    <select value={it.category} onChange={e => updateReviewCategory(it.id, e.target.value)} style={{ fontSize: 12, padding: "5px 6px", color: CAT_COLOR[it.category] }}>
+                      {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+              <label className="sans" style={{ fontSize: 12.5, color: C.textDim, display: "block", marginTop: 14 }}>
+                Somar à fatura:
+                <select value={importTargetMonth} onChange={e => setImportTargetMonth(e.target.value)} style={{ marginTop: 6 }}>
+                  {months.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                </select>
+              </label>
+              <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+                <button onClick={confirmImport} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "9px 16px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Confirmar e somar</button>
+                <button onClick={() => { setReviewItems(null); setImportRaw(""); setShowImport(false); }} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "9px 16px", borderRadius: 6, fontSize: 13, cursor: "pointer" }}>Descartar</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <SectionTitle>Reserva de emergência</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
+          <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 14, flexWrap: "wrap" }} className="sans">
+            <PiggyBank size={18} color={C.gold} />
+            <label style={{ fontSize: 13, color: C.textDim }}>Meta
+              <input type="number" value={config.emergency_goal || ""} onChange={e => saveConfig({ emergency_goal: parseFloat(e.target.value) || 0 })} style={{ width: 110, marginLeft: 8, display: "inline-block" }} />
+            </label>
+            <label style={{ fontSize: 13, color: C.textDim }}>Guardado até agora
+              <input type="number" value={config.emergency_saved || ""} onChange={e => saveConfig({ emergency_saved: parseFloat(e.target.value) || 0 })} style={{ width: 110, marginLeft: 8, display: "inline-block" }} />
+            </label>
+          </div>
+          <div style={{ height: 10, background: C.bg, borderRadius: 5, overflow: "hidden", border: `1px solid ${C.line}` }}>
+            <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg, ${C.goldDim}, ${C.gold})` }} />
+          </div>
+          <div className="sans num" style={{ fontSize: 12.5, color: C.textDim, marginTop: 8 }}>{currency(config.emergency_saved)} de {currency(config.emergency_goal)} · {progress.toFixed(0)}%</div>
+        </div>
+
+        <SectionTitle>Assinaturas identificadas</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 4, marginBottom: 28 }}>
+          {SUBS.map((s, i) => (
+            <div key={i} className="sans" style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: i < SUBS.length - 1 ? `1px solid ${C.line}` : "none", fontSize: 13.5 }}>
+              <span>{s.name}</span><span className="num" style={{ color: C.textDim }}>~{currency(s.est)}/mês</span>
+            </div>
+          ))}
+        </div>
+
+        <SectionTitle>Faturas registradas</SectionTitle>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+          {months.slice().reverse().map(m => (
+            <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)} onRemove={() => removeMonth(m.id)} />
+          ))}
+          {months.length === 0 && <div className="sans" style={{ color: C.textFaint, fontSize: 13, fontStyle: "italic" }}>Nenhuma fatura ainda — adicione a primeira abaixo.</div>}
+        </div>
+
+        {!showForm ? (
+          <button onClick={() => setShowForm(true)} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, width: "100%", justifyContent: "center", marginBottom: 28 }}>
+            <Plus size={16} /> Adicionar fatura do mês manualmente
+          </button>
+        ) : (
+          <div style={{ background: C.surfaceAlt, border: `1px solid ${C.goldDim}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 400 }}>Nova fatura</h3>
+              <button onClick={() => setShowForm(false)} style={{ background: "none", border: "none", cursor: "pointer" }}><X size={18} color={C.textDim} /></button>
+            </div>
+            <div className="sans" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+              <Field label="Mês (ex: Jul/2026)"><input type="text" value={form.label} onChange={e => setForm(f => ({ ...f, label: e.target.value }))} /></Field>
+              <Field label="Total da fatura (R$)"><input type="number" value={form.total} onChange={e => setForm(f => ({ ...f, total: e.target.value }))} /></Field>
+              <Field label="Comprometido em parcelas (R$)"><input type="number" value={form.installmentsCommitted} onChange={e => setForm(f => ({ ...f, installmentsCommitted: e.target.value }))} /></Field>
+              <Field label="Caiu no rotativo?">
+                <select value={form.revolvingUsed ? "sim" : "nao"} onChange={e => setForm(f => ({ ...f, revolvingUsed: e.target.value === "sim" }))}>
+                  <option value="nao">Não</option><option value="sim">Sim</option>
+                </select>
+              </Field>
+            </div>
+            <div className="sans" style={{ fontSize: 12, color: C.textDim, marginBottom: 8 }}>Por categoria (opcional)</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 14 }}>
+              {CATEGORIES.map(cat => (
+                <Field key={cat} label={cat} small><input type="number" value={form.byCategory[cat]} onChange={e => setForm(f => ({ ...f, byCategory: { ...f.byCategory, [cat]: e.target.value } }))} /></Field>
+              ))}
+            </div>
+            <Field label="Notas"><input type="text" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} /></Field>
+            <button onClick={addMonth} className="sans" style={{ marginTop: 14, background: C.gold, color: C.bg, border: "none", padding: "10px 20px", borderRadius: 6, fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>Salvar fatura</button>
+          </div>
+        )}
+
+        <SectionTitle>O que mais ajudaria o planejamento</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
+          {IDEAS.map((idea, i) => (
+            <div key={i} className="sans" style={{ padding: "12px 16px", borderBottom: i < IDEAS.length - 1 ? `1px solid ${C.line}` : "none" }}>
+              <div style={{ fontSize: 13.5, color: C.gold, marginBottom: 3 }}>{idea.t}</div>
+              <div style={{ fontSize: 12.5, color: C.textDim, lineHeight: 1.5 }}>{idea.d}</div>
+            </div>
+          ))}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function ConfidenceBadge({ level }) {
+  const map = { alta: { bg: C.greenDim, fg: C.green, label: "alta" }, "média": { bg: C.amberDim, fg: C.amber, label: "média" }, baixa: { bg: C.redDim, fg: C.red, label: "revisar" }, manual: { bg: C.surfaceAlt, fg: C.textDim, label: "manual" } };
+  const s = map[level] || map.baixa;
+  return <span className="sans" style={{ fontSize: 10, background: s.bg, color: s.fg, padding: "3px 7px", borderRadius: 10, whiteSpace: "nowrap" }}>{s.label}</span>;
+}
+
+function MiniStat({ label, value, tone }) {
+  const toneColor = tone === "good" ? C.green : tone === "bad" ? C.red : C.amber;
+  return (
+    <div style={{ background: C.surfaceAlt, border: `1px solid ${C.line}`, borderRadius: 6, padding: "10px 12px" }}>
+      <div className="sans" style={{ fontSize: 11, color: C.textDim, marginBottom: 4 }}>{label}</div>
+      <div className="num" style={{ fontSize: 16, color: toneColor }}>{value}</div>
+    </div>
+  );
+}
+
+function SummaryCard({ label, value, icon }) {
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: "14px 16px" }}>
+      <div className="sans" style={{ display: "flex", alignItems: "center", gap: 6, color: C.textDim, fontSize: 11.5, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>{icon} {label}</div>
+      <div className="num" style={{ fontSize: 20, color: C.text }}>{value}</div>
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 0 12px" }}>
+      <span style={{ fontSize: 15, color: C.gold, letterSpacing: "0.02em" }}>{children}</span>
+      <div style={{ flex: 1, height: 1, background: C.line }} />
+    </div>
+  );
+}
+
+function Field({ label, children, small }) {
+  return (
+    <label className="sans" style={{ display: "block", fontSize: small ? 11 : 12, color: C.textDim }}>{label}<div style={{ marginTop: 4 }}>{children}</div></label>
+  );
+}
+
+function MonthCard({ m, expanded, onToggle, onRemove }) {
+  const catEntries = Object.entries(m.byCategory || {});
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
+      <div onClick={onToggle} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", cursor: "pointer" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 15 }}>{m.label}</span>
+          {m.revolvingUsed && <span className="sans" style={{ fontSize: 10.5, background: C.redDim, color: C.red, padding: "2px 7px", borderRadius: 10 }}>rotativo</span>}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <span className="num sans" style={{ fontSize: 15, color: C.gold }}>{currency(m.total)}</span>
+          {expanded ? <ChevronUp size={16} color={C.textDim} /> : <ChevronDown size={16} color={C.textDim} />}
+        </div>
+      </div>
+      {expanded && (
+        <div className="sans" style={{ padding: "0 16px 16px", fontSize: 13, color: C.textDim, lineHeight: 1.7 }}>
+          {m.installmentsCommitted > 0 && <div>Comprometido em parcelas: <span className="num" style={{ color: C.text }}>{currency(m.installmentsCommitted)}</span> ({((m.installmentsCommitted / m.total) * 100).toFixed(0)}% da fatura)</div>}
+          {catEntries.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              {catEntries.map(([cat, v]) => (
+                <div key={cat} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0" }}>
+                  <span style={{ color: CAT_COLOR[cat] || C.textDim }}>{cat}</span><span className="num">{currency(v)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {m.lineItems && m.lineItems.length > 0 && (
+            <div className="sans" style={{ marginTop: 8, fontSize: 11.5, color: C.textFaint }}>
+              <Pencil size={11} style={{ verticalAlign: "-1px", marginRight: 4 }} /> {m.lineItems.length} lançamentos classificados
+            </div>
+          )}
+          {m.notes && <div style={{ marginTop: 10, fontStyle: "italic", color: C.textFaint }}>{m.notes}</div>}
+          <button onClick={onRemove} className="sans" style={{ marginTop: 12, background: "none", border: `1px solid ${C.line}`, color: C.textFaint, padding: "5px 10px", borderRadius: 5, fontSize: 11.5, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+            <Trash2 size={12} /> Remover
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
