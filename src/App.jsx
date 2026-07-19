@@ -30,7 +30,13 @@ const RULES = [
   [/mercadolivre|mercado\s?pago|paypal|app\s?\*|jim\.com/i, "Diversos", "baixa"],
 ];
 
-function classify(description) {
+function normalizePattern(description) {
+  return (description || "").trim().toUpperCase();
+}
+
+function classify(description, overrides = {}) {
+  const learned = overrides[normalizePattern(description)];
+  if (learned) return { category: learned, confidence: "aprendida" };
   const d = (description || "").toUpperCase();
   for (const [re, cat, conf] of RULES) if (re.test(d)) return { category: cat, confidence: conf };
   return { category: "Diversos", confidence: "baixa" };
@@ -42,7 +48,7 @@ function parseValue(line) {
   return parseFloat(matches[matches.length - 1].replace(/\./g, "").replace(",", "."));
 }
 
-function parseLines(raw) {
+function parseLines(raw, overrides = {}) {
   const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
   const items = [];
   for (const line of lines) {
@@ -50,20 +56,39 @@ function parseLines(raw) {
     if (value === null || value === 0) continue;
     let desc = line.replace(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g, "").replace(/^\d{2}\/\d{2}\s*/, "").replace(/\d{2}\/\d{2}$/, "").trim();
     if (!desc) desc = line;
-    const { category, confidence } = classify(desc);
-    items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, confidence });
+    const { category, confidence } = classify(desc, overrides);
+    items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, autoCategory: category, confidence });
   }
   return items;
 }
 
-const SUBS = [
-  { name: "Netflify/Netflix", est: 46.71 },
-  { name: "Amazon Prime (BR + Canais + Aluguel + Ad-free)", est: 76.60 },
-  { name: "Google One (aparece 2x na mesma fatura)", est: 29.49 },
-  { name: "McAfee", est: 49.68 },
-  { name: "Alura", est: 109.00 },
-  { name: "PetLove Clube", est: 9.99 },
-];
+function toCSV(months) {
+  const rows = [["Mês", "Total", "Comprometido em parcelas", "Rotativo", "Categoria", "Descrição", "Valor"]];
+  for (const m of months) {
+    if (m.lineItems && m.lineItems.length) {
+      for (const li of m.lineItems) {
+        rows.push([m.label, m.total, m.installmentsCommitted || 0, m.revolvingUsed ? "sim" : "não", li.category, li.description, li.value]);
+      }
+    } else {
+      rows.push([m.label, m.total, m.installmentsCommitted || 0, m.revolvingUsed ? "sim" : "não", "", "", ""]);
+    }
+  }
+  return rows.map(r => r.map(v => {
+    const s = String(v ?? "");
+    return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(";")).join("\n");
+}
+
+function downloadCSV(months) {
+  const csv = "﻿" + toCSV(months);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `mesa-financeiro-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const IDEAS = [
   { t: "Fixo x variável", d: "Separar o que se repete todo mês no mesmo valor (assinaturas, parcelas) do que varia mostra quanto do orçamento é realmente flexível." },
@@ -124,6 +149,15 @@ export default function App() {
   const [reviewItems, setReviewItems] = useState(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
   const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
+  const [overrides, setOverrides] = useState({});
+  const [errorMsg, setErrorMsg] = useState("");
+  const [incomeInput, setIncomeInput] = useState("");
+
+  function reportError(context, error) {
+    if (!error) return;
+    console.error(context, error);
+    setErrorMsg(`${context}: ${error.message || "erro desconhecido"}`);
+  }
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -132,8 +166,12 @@ export default function App() {
   }, []);
 
   const loadData = useCallback(async (userId) => {
-    const { data: faturas } = await supabase.from("faturas").select("*, lancamentos(*)").eq("user_id", userId).order("created_at");
-    const { data: cfg } = await supabase.from("financeiro_config").select("*").eq("user_id", userId).maybeSingle();
+    const { data: faturas, error: faturasErr } = await supabase.from("faturas").select("*, lancamentos(*)").eq("user_id", userId).order("created_at");
+    if (faturasErr) reportError("Erro ao carregar faturas", faturasErr);
+    const { data: cfg, error: cfgErr } = await supabase.from("financeiro_config").select("*").eq("user_id", userId).maybeSingle();
+    if (cfgErr) reportError("Erro ao carregar configuração", cfgErr);
+    const { data: overrideRows, error: overridesErr } = await supabase.from("categoria_overrides").select("*").eq("user_id", userId);
+    if (overridesErr) reportError("Erro ao carregar correções aprendidas", overridesErr);
     if (faturas) {
       setMonths(faturas.map(f => {
         const byCategory = {};
@@ -141,7 +179,8 @@ export default function App() {
         return { id: f.id, label: f.label, total: Number(f.total), installmentsCommitted: Number(f.installments_committed || 0), revolvingUsed: f.revolving_used, notes: f.notes, byCategory, lineItems: f.lancamentos || [] };
       }));
     }
-    if (cfg) setConfig(cfg);
+    if (cfg) { setConfig(cfg); setIncomeInput(String(cfg.monthly_income ?? "")); }
+    if (overrideRows) setOverrides(Object.fromEntries(overrideRows.map(r => [r.pattern, r.category])));
   }, []);
 
   useEffect(() => {
@@ -157,10 +196,44 @@ export default function App() {
   const leftover = (config.monthly_income || 0) - avgTotal;
   const savingsRate = config.monthly_income ? (leftover / config.monthly_income) * 100 : null;
 
+  const subscriptions = useMemo(() => {
+    const byPattern = {};
+    for (const m of months) {
+      for (const li of m.lineItems || []) {
+        if (li.category !== "Assinaturas") continue;
+        const key = normalizePattern(li.description);
+        if (!byPattern[key]) byPattern[key] = { name: li.description, total: 0, count: 0 };
+        byPattern[key].total += Number(li.value);
+        byPattern[key].count += 1;
+      }
+    }
+    return Object.values(byPattern)
+      .map(s => ({ name: s.name, est: s.total / s.count }))
+      .sort((a, b) => b.est - a.est);
+  }, [months]);
+
   async function saveConfig(patch) {
     const next = { ...config, ...patch };
     setConfig(next);
-    await supabase.from("financeiro_config").upsert({ user_id: session.user.id, ...next });
+    const { error } = await supabase.from("financeiro_config").upsert({ user_id: session.user.id, ...next });
+    reportError("Erro ao salvar configuração", error);
+  }
+
+  // debounce: só grava a renda no Supabase depois que o usuário para de digitar
+  useEffect(() => {
+    if (session === null || session === undefined) return;
+    const parsed = parseFloat(incomeInput) || 0;
+    if (parsed === (config.monthly_income || 0)) return;
+    const t = setTimeout(() => { saveConfig({ monthly_income: parsed }); }, 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incomeInput]);
+
+  async function upsertOverride(pattern, category) {
+    if (!pattern) return;
+    setOverrides(prev => ({ ...prev, [pattern]: category }));
+    const { error } = await supabase.from("categoria_overrides").upsert({ user_id: session.user.id, pattern, category }, { onConflict: "user_id,pattern" });
+    reportError("Erro ao salvar correção de categoria", error);
   }
 
   async function addMonth() {
@@ -169,23 +242,40 @@ export default function App() {
       user_id: session.user.id, label: form.label, total: parseFloat(form.total),
       installments_committed: parseFloat(form.installmentsCommitted || 0), revolving_used: form.revolvingUsed, notes: form.notes,
     }).select().single();
-    if (error || !data) return;
+    if (error || !data) { reportError("Erro ao salvar fatura", error); return; }
     const catRows = Object.entries(form.byCategory).filter(([, v]) => v).map(([cat, v]) => ({
       fatura_id: data.id, user_id: session.user.id, description: "Ajuste manual", value: parseFloat(v), category: cat, confidence: "manual",
     }));
-    if (catRows.length) await supabase.from("lancamentos").insert(catRows);
+    if (catRows.length) {
+      const { error: catErr } = await supabase.from("lancamentos").insert(catRows);
+      reportError("Erro ao salvar categorias da fatura", catErr);
+    }
     setForm({ label: "", total: "", installmentsCommitted: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
     setShowForm(false);
     loadData(session.user.id);
   }
 
   async function removeMonth(id) {
-    await supabase.from("faturas").delete().eq("id", id);
+    const { error } = await supabase.from("faturas").delete().eq("id", id);
+    if (error) { reportError("Erro ao remover fatura", error); return; }
     setMonths(prev => prev.filter(m => m.id !== id));
   }
 
+  async function removeLineItem(fatura, lineItemId) {
+    const { error } = await supabase.from("lancamentos").delete().eq("id", lineItemId);
+    if (error) { reportError("Erro ao remover lançamento", error); return; }
+    loadData(session.user.id);
+  }
+
+  async function updateLineItemCategory(lineItem, category) {
+    const { error } = await supabase.from("lancamentos").update({ category }).eq("id", lineItem.id);
+    if (error) { reportError("Erro ao atualizar categoria do lançamento", error); return; }
+    await upsertOverride(normalizePattern(lineItem.description), category);
+    loadData(session.user.id);
+  }
+
   function runClassification() {
-    const items = parseLines(importRaw);
+    const items = parseLines(importRaw, overrides);
     setReviewItems(items);
     if (months.length) setImportTargetMonth(months[months.length - 1].id);
   }
@@ -199,7 +289,10 @@ export default function App() {
     const rows = reviewItems.map(it => ({
       fatura_id: importTargetMonth, user_id: session.user.id, description: it.desc, value: it.value, category: it.category, confidence: it.confidence,
     }));
-    await supabase.from("lancamentos").insert(rows);
+    const { error } = await supabase.from("lancamentos").insert(rows);
+    if (error) { reportError("Erro ao importar lançamentos", error); return; }
+    const corrections = reviewItems.filter(it => it.category !== it.autoCategory);
+    for (const it of corrections) await upsertOverride(normalizePattern(it.desc), it.category);
     setReviewItems(null);
     setImportRaw("");
     setShowImport(false);
@@ -238,6 +331,16 @@ export default function App() {
 
       <main style={{ maxWidth: 880, margin: "0 auto", padding: "28px 20px 60px" }}>
 
+        {errorMsg && (
+          <div className="sans" style={{ background: C.redDim, border: `1px solid ${C.red}`, borderRadius: 6, padding: "12px 14px", marginBottom: 20, display: "flex", gap: 10, alignItems: "flex-start", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", gap: 10 }}>
+              <AlertTriangle size={16} color={C.red} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span style={{ fontSize: 13, color: C.text }}>{errorMsg}</span>
+            </div>
+            <button onClick={() => setErrorMsg("")} aria-label="Fechar aviso" style={{ background: "none", border: "none", cursor: "pointer", flexShrink: 0 }}><X size={15} color={C.textDim} /></button>
+          </div>
+        )}
+
         <div style={{ background: C.surface, border: `1px solid ${C.goldDim}`, borderLeft: `3px solid ${C.gold}`, borderRadius: 6, padding: "16px 18px", marginBottom: 24, display: "flex", gap: 14 }}>
           <AlertTriangle size={20} color={C.gold} style={{ flexShrink: 0, marginTop: 2 }} />
           <div className="sans" style={{ fontSize: 13.5, lineHeight: 1.6 }}>
@@ -250,7 +353,7 @@ export default function App() {
           <div className="sans" style={{ marginBottom: 14 }}>
             <label style={{ fontSize: 13, color: C.textDim }}>
               Renda líquida mensal
-              <input type="number" value={config.monthly_income || ""} onChange={e => saveConfig({ monthly_income: parseFloat(e.target.value) || 0 })} placeholder="0,00" style={{ marginTop: 6, maxWidth: 220 }} />
+              <input type="number" value={incomeInput} onChange={e => setIncomeInput(e.target.value)} placeholder="0,00" style={{ marginTop: 6, maxWidth: 220 }} />
             </label>
           </div>
           {config.monthly_income > 0 ? (
@@ -353,17 +456,30 @@ export default function App() {
 
         <SectionTitle>Assinaturas identificadas</SectionTitle>
         <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 4, marginBottom: 28 }}>
-          {SUBS.map((s, i) => (
-            <div key={i} className="sans" style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: i < SUBS.length - 1 ? `1px solid ${C.line}` : "none", fontSize: 13.5 }}>
+          {subscriptions.length === 0 && (
+            <div className="sans" style={{ padding: "12px 14px", fontSize: 12.5, color: C.textFaint, fontStyle: "italic" }}>
+              Nenhuma assinatura identificada ainda — lançamentos classificados como "Assinaturas" aparecem aqui.
+            </div>
+          )}
+          {subscriptions.map((s, i) => (
+            <div key={s.name} className="sans" style={{ display: "flex", justifyContent: "space-between", padding: "10px 14px", borderBottom: i < subscriptions.length - 1 ? `1px solid ${C.line}` : "none", fontSize: 13.5 }}>
               <span>{s.name}</span><span className="num" style={{ color: C.textDim }}>~{currency(s.est)}/mês</span>
             </div>
           ))}
         </div>
 
-        <SectionTitle>Faturas registradas</SectionTitle>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "0 0 12px" }}>
+          <span style={{ fontSize: 15, color: C.gold, letterSpacing: "0.02em" }}>Faturas registradas</span>
+          {months.length > 0 && (
+            <button onClick={() => downloadCSV(months)} className="sans" style={{ background: "none", border: `1px solid ${C.line}`, color: C.textDim, padding: "5px 10px", borderRadius: 6, fontSize: 12, cursor: "pointer" }}>
+              Exportar CSV
+            </button>
+          )}
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
           {months.slice().reverse().map(m => (
-            <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)} onRemove={() => removeMonth(m.id)} />
+            <MonthCard key={m.id} m={m} expanded={expanded === m.id} onToggle={() => setExpanded(expanded === m.id ? null : m.id)}
+              onRemove={() => removeMonth(m.id)} onRemoveLineItem={(liId) => removeLineItem(m, liId)} onUpdateLineItemCategory={updateLineItemCategory} />
           ))}
           {months.length === 0 && <div className="sans" style={{ color: C.textFaint, fontSize: 13, fontStyle: "italic" }}>Nenhuma fatura ainda — adicione a primeira abaixo.</div>}
         </div>
