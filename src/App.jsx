@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Plus, TrendingUp, AlertTriangle, PiggyBank, CreditCard, Trash2, ChevronDown, ChevronUp, Check, X, Sparkles, Pencil, LogOut, Mail, Target, FileUp, Lock } from "lucide-react";
 import { supabase } from "./supabaseClient";
@@ -52,8 +52,14 @@ function classify(description, overrides = {}) {
   return { category: "Diversos", confidence: "baixa" };
 }
 
+// Valor em reais: aceita tanto "1.234,56" (com separador de milhar) quanto "1234,56"
+// (sem o ponto — como alguns bancos imprimem e como o pdf.js às vezes reconstrói o texto).
+// A alternância evita o bug de "1234,56" virar "234,56" (a regex antiga exigia o ponto
+// de milhar e casava só os 3 últimos dígitos antes da vírgula).
+const MONEY_RE = /-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}/g;
+
 function parseValue(line) {
-  const matches = line.match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g);
+  const matches = line.match(MONEY_RE);
   if (!matches || matches.length === 0) return null;
   return parseFloat(matches[matches.length - 1].replace(/\./g, "").replace(",", "."));
 }
@@ -64,7 +70,7 @@ function parseLines(raw, overrides = {}) {
   for (const line of lines) {
     const value = parseValue(line);
     if (value === null || value === 0) continue;
-    let desc = line.replace(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g, "").replace(/^\d{2}\/\d{2}\s*/, "").replace(/\d{2}\/\d{2}$/, "").trim();
+    let desc = line.replace(MONEY_RE, "").replace(/^\d{2}\/\d{2}\s*/, "").replace(/\d{2}\/\d{2}$/, "").trim();
     if (!desc) desc = line;
     const { category, confidence } = classify(desc, overrides);
     items.push({ id: "i" + Math.random().toString(36).slice(2), desc, value: Math.abs(value), category, autoCategory: category, confidence });
@@ -161,7 +167,6 @@ export default function App() {
   const [pdfPendingFile, setPdfPendingFile] = useState(null); // PDF protegido aguardando senha
   const [pdfPassword, setPdfPassword] = useState("");
   const [pdfError, setPdfError] = useState("");
-  const pdfInputRef = useRef(null);
   const [importTargetMonth, setImportTargetMonth] = useState("");
   const [importNewLabel, setImportNewLabel] = useState("");
   const [form, setForm] = useState({ label: "", total: "", installmentsCommitted: "", bankBalance: "", revolvingUsed: false, notes: "", byCategory: Object.fromEntries(CATEGORIES.map(c => [c, ""])) });
@@ -342,25 +347,35 @@ export default function App() {
   async function processPdf(file, password) {
     setPdfBusy(true);
     setPdfError("");
+    // import dinâmico: o pdf.js (~400 KB) só é baixado quando o recurso é usado.
+    // Se ESSE carregamento falha, quase sempre é uma versão antiga em cache (PWA) apontando
+    // pra um arquivo que não existe mais depois de um deploy — o remédio é recarregar a página.
     let pdf;
     try {
-      // import dinâmico: o pdf.js (~400 KB) só é baixado quando o recurso é usado
       pdf = await import("./pdfImport");
+    } catch (err) {
+      console.error("Falha ao carregar o leitor de PDF", err);
+      setPdfError("Não consegui carregar o leitor de PDF (provável versão antiga em cache). Recarregue a página — no celular, puxe a tela pra baixo pra atualizar — e tente de novo.");
+      setPdfBusy(false);
+      return;
+    }
+    try {
       const buffer = await file.arrayBuffer(); // relido a cada tentativa: o worker do pdf.js consome o buffer
       const text = await pdf.extractPdfText(buffer, password);
       const items = parseLines(pdf.dropSummaryLines(text), overrides);
       if (!items.length) {
-        setPdfError("Não encontrei lançamentos nesse PDF. Se for uma fatura escaneada (imagem), o texto não é extraível — nesse caso, cole os lançamentos manualmente.");
+        setPdfError("Li o PDF, mas não encontrei nenhum lançamento com valor (ex.: 39,90). Se a fatura for escaneada ou uma foto, o texto não é extraível — nesse caso, cole os lançamentos manualmente.");
         return;
       }
       setPdfPendingFile(null);
       setPdfPassword("");
       startReview(items);
     } catch (err) {
-      if (pdf && err.message === pdf.PDF_PASSWORD_NEEDED) { setPdfPendingFile(file); return; }
-      if (pdf && err.message === pdf.PDF_PASSWORD_WRONG) { setPdfPendingFile(file); setPdfError("Senha incorreta — tente de novo (bancos costumam usar os primeiros dígitos do CPF)."); return; }
+      if (err.message === pdf.PDF_PASSWORD_NEEDED) { setPdfPendingFile(file); return; }
+      if (err.message === pdf.PDF_PASSWORD_WRONG) { setPdfPendingFile(file); setPdfError("Senha incorreta — tente de novo (bancos costumam usar os primeiros dígitos do CPF)."); return; }
       console.error("Erro ao ler PDF", err);
-      setPdfError("Não consegui ler esse PDF. Você ainda pode colar os lançamentos manualmente.");
+      const detail = err && err.message ? ` (${err.message})` : "";
+      setPdfError(`Não consegui ler esse PDF${detail}. Você ainda pode colar os lançamentos manualmente.`);
     } finally {
       setPdfBusy(false);
     }
@@ -533,10 +548,19 @@ export default function App() {
                 <button onClick={() => setShowImport(true)} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, justifyContent: "center" }}>
                   <Sparkles size={16} /> Colar lançamentos da fatura
                 </button>
-                <button onClick={() => pdfInputRef.current && pdfInputRef.current.click()} disabled={pdfBusy} className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: pdfBusy ? "wait" : "pointer", fontSize: 14, justifyContent: "center", opacity: pdfBusy ? 0.6 : 1 }}>
-                  <FileUp size={16} /> {pdfBusy ? "Lendo PDF..." : "Enviar PDF da fatura"}
-                </button>
-                <input ref={pdfInputRef} type="file" accept="application/pdf,.pdf" onChange={handlePdfSelected} style={{ display: "none" }} />
+                {pdfBusy ? (
+                  <span className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "wait", fontSize: 14, justifyContent: "center", opacity: 0.6 }}>
+                    <FileUp size={16} /> Lendo PDF...
+                  </span>
+                ) : (
+                  // label + input escondido (mas não display:none): a forma mais confiável de abrir
+                  // o seletor de arquivos no celular — não depende de um .click() programático,
+                  // que alguns navegadores móveis bloqueiam.
+                  <label className="sans" style={{ display: "flex", alignItems: "center", gap: 8, background: "transparent", border: `1px dashed ${C.goldDim}`, color: C.gold, padding: "12px 16px", borderRadius: 6, cursor: "pointer", fontSize: 14, justifyContent: "center" }}>
+                    <FileUp size={16} /> Enviar PDF da fatura
+                    <input type="file" accept="application/pdf,.pdf" onChange={handlePdfSelected} style={{ position: "absolute", width: 1, height: 1, opacity: 0, overflow: "hidden", pointerEvents: "none" }} />
+                  </label>
+                )}
               </div>
               {pdfPendingFile && (
                 <div className="sans" style={{ marginTop: 12, background: C.surfaceAlt, border: `1px solid ${C.line}`, borderRadius: 6, padding: "12px 14px" }}>
