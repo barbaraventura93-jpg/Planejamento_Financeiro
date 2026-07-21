@@ -13,7 +13,7 @@ function insight(tone, priority, title, detail) {
   return { tone, priority, title, detail };
 }
 
-export function buildDiagnostics({ months, config }) {
+export function buildDiagnostics({ months, config, investmentsTotal = null }) {
   const out = [];
   if (!months || months.length === 0) {
     return [insight("action", 0, "Comece registrando uma fatura",
@@ -167,6 +167,21 @@ export function buildDiagnostics({ months, config }) {
     } else {
       out.push(insight("action", 4, "Reserva ainda no começo",
         `${fmt(saved)} de ${fmt(goal)}. Antes de acelerar a reserva, o diagnóstico acima indica onde abrir espaço no orçamento.`));
+    }
+  }
+
+  // ---------- patrimônio (quando os investimentos estão cadastrados) ----------
+  if (typeof investmentsTotal === "number" && avgTotal > 0) {
+    const wealth = investmentsTotal + saved;
+    if (wealth > 0) {
+      const monthsCover = wealth / avgTotal;
+      if (monthsCover >= 6) {
+        out.push(insight("good", 3, `Patrimônio cobre ~${monthsCover.toFixed(0)} meses do seu padrão de gasto`,
+          `Investimentos (${fmt(investmentsTotal)}) + reserva (${fmt(saved)}) somam ${fmt(wealth)}. Isso é segurança real: mesmo sem renda, você sustentaria o padrão atual por vários meses.`));
+      } else {
+        out.push(insight("good", 5, `Patrimônio de ${fmt(wealth)} (~${monthsCover.toFixed(1)} meses de gasto)`,
+          `Acompanhar esse número todo mês é o melhor termômetro de progresso: ele resume se o conjunto (gasto + poupança + investimento) está andando na direção certa.`));
+      }
     }
   }
 

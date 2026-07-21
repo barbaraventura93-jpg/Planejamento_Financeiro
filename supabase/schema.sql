@@ -43,6 +43,17 @@ create table if not exists financeiro_config (
   updated_at timestamptz default now()
 );
 
+-- ---------- posições de investimento (patrimônio líquido) ----------
+create table if not exists investimentos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  category text,
+  value numeric(14,2) not null default 0,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 -- ---------- correções de categoria aprendidas (feedback do usuário) ----------
 create table if not exists categoria_overrides (
   id uuid primary key default gen_random_uuid(),
@@ -58,6 +69,7 @@ alter table faturas enable row level security;
 alter table fatura_cards enable row level security;
 alter table lancamentos enable row level security;
 alter table financeiro_config enable row level security;
+alter table investimentos enable row level security;
 alter table categoria_overrides enable row level security;
 
 -- faturas: cada usuário só vê/edita as próprias
@@ -84,6 +96,12 @@ create policy "lancamentos_delete_own" on lancamentos for delete using (auth.uid
 create policy "config_select_own" on financeiro_config for select using (auth.uid() = user_id);
 create policy "config_upsert_own" on financeiro_config for insert with check (auth.uid() = user_id);
 create policy "config_update_own" on financeiro_config for update using (auth.uid() = user_id);
+
+-- investimentos: cada usuário só vê/edita os próprios
+create policy "investimentos_select_own" on investimentos for select using (auth.uid() = user_id);
+create policy "investimentos_insert_own" on investimentos for insert with check (auth.uid() = user_id);
+create policy "investimentos_update_own" on investimentos for update using (auth.uid() = user_id);
+create policy "investimentos_delete_own" on investimentos for delete using (auth.uid() = user_id);
 
 -- categoria_overrides: cada usuário só vê/edita as próprias correções
 create policy "overrides_select_own" on categoria_overrides for select using (auth.uid() = user_id);

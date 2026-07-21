@@ -6,6 +6,7 @@ import { buildDiagnostics } from "./advisor";
 import { sortMonths } from "./monthOrder";
 
 const NEW_FATURA = "__nova__";
+const INV_CATEGORIES = ["Renda fixa", "Tesouro Direto", "Ações", "Fundos/ETFs", "Cripto", "Previdência", "Imóveis", "Outros"];
 const MONTH_SHORT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
 function suggestMonthLabel() {
   const now = new Date();
@@ -167,6 +168,8 @@ export default function App() {
   const [overrides, setOverrides] = useState({});
   const [errorMsg, setErrorMsg] = useState("");
   const [incomeInput, setIncomeInput] = useState("");
+  const [investments, setInvestments] = useState([]);
+  const [invForm, setInvForm] = useState({ name: "", value: "", category: INV_CATEGORIES[0] });
 
   function reportError(context, error) {
     if (!error) return;
@@ -187,6 +190,9 @@ export default function App() {
     if (cfgErr) reportError("Erro ao carregar configuração", cfgErr);
     const { data: overrideRows, error: overridesErr } = await supabase.from("categoria_overrides").select("*").eq("user_id", userId);
     if (overridesErr) reportError("Erro ao carregar correções aprendidas", overridesErr);
+    const { data: invRows, error: invErr } = await supabase.from("investimentos").select("*").eq("user_id", userId).order("created_at");
+    if (invErr) reportError("Erro ao carregar investimentos", invErr);
+    if (invRows) setInvestments(invRows);
     if (faturas) {
       setMonths(sortMonths(faturas.map(f => {
         const byCategory = {};
@@ -221,7 +227,25 @@ export default function App() {
   const leftover = (config.monthly_income || 0) - avgTotal;
   const savingsRate = config.monthly_income ? (leftover / config.monthly_income) * 100 : null;
 
-  const diagnostics = useMemo(() => buildDiagnostics({ months, config }), [months, config]);
+  const investTotal = useMemo(() => investments.reduce((a, i) => a + Number(i.value || 0), 0), [investments]);
+  const investByCategory = useMemo(() => {
+    const g = {};
+    for (const i of investments) {
+      const cat = i.category || "Outros";
+      g[cat] = (g[cat] || 0) + Number(i.value || 0);
+    }
+    return Object.entries(g).sort((a, b) => b[1] - a[1]);
+  }, [investments]);
+  const lastBankBalance = useMemo(() => {
+    const wb = months.filter(m => m.bankBalance !== null && m.bankBalance !== undefined);
+    return wb.length ? wb[wb.length - 1].bankBalance : null;
+  }, [months]);
+  const netWorth = investTotal + Number(config.emergency_saved || 0) + (lastBankBalance ?? 0);
+
+  const diagnostics = useMemo(
+    () => buildDiagnostics({ months, config, investmentsTotal: investments.length ? investTotal : null }),
+    [months, config, investments.length, investTotal]
+  );
 
   const subscriptions = useMemo(() => {
     const byPattern = {};
@@ -357,6 +381,31 @@ export default function App() {
       const next = prev.filter(it => it.id !== id);
       return next.length ? next : null;
     });
+  }
+
+  async function addInvestment() {
+    if (!invForm.name.trim() || invForm.value === "" || !session) return;
+    const { data, error } = await supabase.from("investimentos").insert({
+      user_id: session.user.id, name: invForm.name.trim(), category: invForm.category, value: parseFloat(invForm.value) || 0,
+    }).select().single();
+    if (error || !data) { reportError("Erro ao adicionar investimento", error); return; }
+    setInvestments(prev => [...prev, data]);
+    setInvForm(f => ({ name: "", value: "", category: f.category }));
+  }
+
+  function updateInvestmentValue(id, value) {
+    setInvestments(prev => prev.map(i => i.id === id ? { ...i, value } : i));
+  }
+
+  async function persistInvestmentValue(id, value) {
+    const { error } = await supabase.from("investimentos").update({ value: parseFloat(value) || 0, updated_at: new Date().toISOString() }).eq("id", id);
+    reportError("Erro ao atualizar investimento", error);
+  }
+
+  async function removeInvestment(id) {
+    const { error } = await supabase.from("investimentos").delete().eq("id", id);
+    if (error) { reportError("Erro ao remover investimento", error); return; }
+    setInvestments(prev => prev.filter(i => i.id !== id));
   }
 
   const reviewSum = useMemo(() => (reviewItems || []).reduce((a, it) => a + it.value, 0), [reviewItems]);
@@ -592,6 +641,63 @@ export default function App() {
             <div style={{ height: "100%", width: `${progress}%`, background: `linear-gradient(90deg, ${C.goldDim}, ${C.gold})` }} />
           </div>
           <div className="sans num" style={{ fontSize: 12.5, color: C.textDim, marginTop: 8 }}>{currency(config.emergency_saved)} de {currency(config.emergency_goal)} · {progress.toFixed(0)}%</div>
+        </div>
+
+        <SectionTitle>Patrimônio líquido</SectionTitle>
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 8, padding: 18, marginBottom: 28 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+            <span className="num" style={{ fontSize: 28, color: C.gold }}>{currency(netWorth)}</span>
+            <span className="sans" style={{ fontSize: 12, color: C.textFaint }}>investimentos + reserva{lastBankBalance !== null ? " + saldo em conta" : ""}</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 16 }} className="sans">
+            <MiniStat label="Investimentos" value={currency(investTotal)} tone="good" />
+            <MiniStat label="Reserva de emergência" value={currency(config.emergency_saved)} tone="neutral" />
+            {lastBankBalance !== null && <MiniStat label="Saldo em conta (último mês)" value={currency(lastBankBalance)} tone={lastBankBalance >= 0 ? "neutral" : "bad"} />}
+          </div>
+
+          {investByCategory.length > 0 && (
+            <div className="sans" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+              {investByCategory.map(([cat, v]) => (
+                <span key={cat} style={{ fontSize: 11.5, background: C.surfaceAlt, border: `1px solid ${C.line}`, color: C.textDim, padding: "4px 10px", borderRadius: 12 }}>
+                  {cat}: <span className="num" style={{ color: C.text }}>{currency(v)}</span>{investTotal > 0 && <span style={{ color: C.textFaint }}> · {((v / investTotal) * 100).toFixed(0)}%</span>}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {investments.length > 0 && (
+            <div style={{ border: `1px solid ${C.line}`, borderRadius: 6, overflow: "hidden", marginBottom: 14 }}>
+              {investments.map(inv => (
+                <div key={inv.id} className="sans" style={{ display: "grid", gridTemplateColumns: "1fr auto auto auto", gap: 8, alignItems: "center", padding: "8px 10px", borderBottom: `1px solid ${C.line}` }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{inv.name}</div>
+                    <div style={{ fontSize: 10.5, color: C.textFaint }}>{inv.category || "Outros"}</div>
+                  </div>
+                  <input type="number" value={inv.value} onChange={e => updateInvestmentValue(inv.id, e.target.value)} onBlur={e => persistInvestmentValue(inv.id, e.target.value)} style={{ width: 120, fontSize: 12.5, padding: "5px 8px", textAlign: "right" }} className="num" />
+                  <span />
+                  <button onClick={() => removeInvestment(inv.id)} aria-label={`Remover ${inv.name}`} title="Remover" style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}>
+                    <Trash2 size={13} color={C.textFaint} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="sans" style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 8, alignItems: "end" }}>
+            <Field label="Onde está" small><input type="text" value={invForm.name} onChange={e => setInvForm(f => ({ ...f, name: e.target.value }))} placeholder="ex: CDB Banco X" /></Field>
+            <Field label="Tipo" small>
+              <select value={invForm.category} onChange={e => setInvForm(f => ({ ...f, category: e.target.value }))}>
+                {INV_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </Field>
+            <Field label="Valor atual (R$)" small><input type="number" value={invForm.value} onChange={e => setInvForm(f => ({ ...f, value: e.target.value }))} /></Field>
+            <button onClick={addInvestment} disabled={!invForm.name.trim() || invForm.value === ""} className="sans" style={{ background: C.gold, color: C.bg, border: "none", padding: "9px 14px", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: (!invForm.name.trim() || invForm.value === "") ? "not-allowed" : "pointer", opacity: (!invForm.name.trim() || invForm.value === "") ? 0.45 : 1 }}>
+              <Plus size={14} style={{ verticalAlign: "-2px" }} /> Adicionar
+            </button>
+          </div>
+          <div className="sans" style={{ fontSize: 11.5, color: C.textFaint, marginTop: 12, lineHeight: 1.5 }}>
+            Atualize os valores quando quiser (ex.: uma vez por mês) — o número acima é a foto de hoje. Parcelas futuras do cartão ainda não são descontadas. Este painel organiza e acompanha; ele não recomenda onde investir.
+          </div>
         </div>
 
         <SectionTitle>Assinaturas identificadas</SectionTitle>
